@@ -1,12 +1,9 @@
 name: Rust
 
+# Manual trigger ONLY. This workflow never runs automatically on push, pull
+# request, or tags. Start it yourself from the Actions tab (Run workflow).
 on:
-  push:
-    branches: [ "master" ]
-    tags:
-      - 'v*'
-  pull_request:
-    branches: [ "master" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,6 +15,8 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+    - name: Install ALSA (cpal dev-dep, used by the streaming_mic example)
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests
@@ -25,7 +24,7 @@ jobs:
 
   # Compile + test the optional, feature-gated modules and their examples.
   # Without this, sortformer / multitalker / cohere (and the cohere example)
-  # are never built in CI and can break while the default build stays green.
+  # are never built and can break while the default build stays green.
   features:
     runs-on: ubuntu-latest
     strategy:
@@ -40,14 +39,16 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+    - name: Install ALSA (cpal dev-dep, used by the streaming_mic example)
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: Build (features + examples)
       run: cargo build --all-targets --features "${{ matrix.features }}"
     - name: Test
       run: cargo test --features "${{ matrix.features }}"
 
   # Formatting and lint. Non-blocking for now: the existing tree is not yet
-  # fmt/clippy clean, and reformatting it wholesale is out of scope for this
-  # change. Tracked as a follow-up; flip continue-on-error off once clean.
+  # fmt/clippy clean, and reformatting it wholesale is out of scope. Flip
+  # continue-on-error off once a dedicated cleanup lands.
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -56,6 +57,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
+    - name: Install ALSA (cpal dev-dep, used by the streaming_mic example)
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
     - name: rustfmt
       continue-on-error: true
       run: cargo fmt --all --check
