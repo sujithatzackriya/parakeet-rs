@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
-use ndarray::{Array1, Array2, Array3, Array4};
+use ndarray::{Array1, Array3, Array4};
 use ort::session::{Session, SessionInputValue};
 use ort::value::ValueType;
 use std::borrow::Cow;
@@ -283,53 +283,12 @@ impl NemotronModel {
         state_1: &Array3<f32>, // [2, 1, 640]
         state_2: &Array3<f32>, // [2, 1, 640]
     ) -> Result<(Array1<f32>, Array3<f32>, Array3<f32>)> {
-        let targets = Array2::from_shape_vec((1, 1), vec![target_token])
-            .map_err(|e| Error::Model(format!("Failed to create targets: {e}")))?;
-        let target_len = Array1::from_vec(vec![1i32]);
-
-        let outputs = self.decoder_joint.run(ort::inputs![
-            "encoder_outputs" => ort::value::Value::from_array(encoder_frame.clone())?,
-            "targets" => ort::value::Value::from_array(targets)?,
-            "target_length" => ort::value::Value::from_array(target_len)?,
-            "input_states_1" => ort::value::Value::from_array(state_1.clone())?,
-            "input_states_2" => ort::value::Value::from_array(state_2.clone())?
-        ])?;
-
-        // logits for others I think you can understand by looking at the error msgs right?
-        let (_l_shape, l_data) = outputs["outputs"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
-
-        let logits = Array1::from_vec(l_data.to_vec());
-
-        let (h_shape, h_data) = outputs["output_states_1"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_1: {e}")))?;
-
-        let (c_shape, c_data) = outputs["output_states_2"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_2: {e}")))?;
-
-        let new_state_1 = Array3::from_shape_vec(
-            (
-                h_shape[0] as usize,
-                h_shape[1] as usize,
-                h_shape[2] as usize,
-            ),
-            h_data.to_vec(),
+        crate::onnx::run_rnnt_decoder_step(
+            &mut self.decoder_joint,
+            encoder_frame,
+            target_token,
+            state_1,
+            state_2,
         )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_1: {e}")))?;
-
-        let new_state_2 = Array3::from_shape_vec(
-            (
-                c_shape[0] as usize,
-                c_shape[1] as usize,
-                c_shape[2] as usize,
-            ),
-            c_data.to_vec(),
-        )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
-
-        Ok((logits, new_state_1, new_state_2))
     }
 }

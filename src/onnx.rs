@@ -33,7 +33,9 @@
 
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
+use ndarray::{Array1, Array2, Array3};
 use ort::session::Session;
+use ort::value::TensorRef;
 use std::path::{Path, PathBuf};
 
 /// Build an ONNX [`Session`] from a file, applying the execution config exactly
@@ -137,6 +139,77 @@ pub(crate) fn resolve_onnx_file(
         "No {role} model found in {}",
         dir.display()
     )))
+}
+
+/// One RNNT decoder/joint step shared by the Nemotron and Unified wrappers.
+///
+/// These two `run_decoder` bodies were byte-for-byte equivalent (the only
+/// textual difference was building the 1x1 `i32` targets array via
+/// `Array2::from_shape_vec` vs `Array2::from_elem`, which yield the identical
+/// array), so the helper takes ZERO config knobs - it is the same function.
+/// The other RNNT variants are intentionally NOT routed through here:
+/// Multitalker uses `i64` targets, omits `target_length`, and reads
+/// `states_*` instead of `output_states_*`; EOU returns `Array3` logits with a
+/// hardcoded state reshape; TDT inlines the step with duration-token splitting.
+///
+/// Inputs are bound zero-copy via [`TensorRef::from_array_view`] instead of an
+/// owning `Value::from_array(x.clone())`. `from_array_view` borrows the backing
+/// slice and ERRORS on a non-contiguous layout (unlike `from_array`, which would
+/// silently copy), so each input is asserted standard-layout up front - if a
+/// future caller ever passes a sliced/transposed view it fails loudly here
+/// rather than at the ORT boundary. All current call sites pass freshly-owned,
+/// C-contiguous arrays, so the bound bytes are identical to the old clone path.
+///
+/// Returns `(logits [vocab], new_state_1, new_state_2)`.
+pub(crate) fn run_rnnt_decoder_step(
+    session: &mut Session,
+    encoder_frame: &Array3<f32>, // [1, hidden_dim, 1]
+    target_token: i32,
+    state_1: &Array3<f32>, // [layers, 1, lstm_dim]
+    state_2: &Array3<f32>, // [layers, 1, lstm_dim]
+) -> Result<(Array1<f32>, Array3<f32>, Array3<f32>)> {
+    let targets = Array2::from_elem((1, 1), target_token);
+    let target_length = Array1::from_elem(1, 1i32);
+
+    debug_assert!(encoder_frame.is_standard_layout(), "encoder_frame must be C-contiguous");
+    debug_assert!(targets.is_standard_layout(), "targets must be C-contiguous");
+    debug_assert!(target_length.is_standard_layout(), "target_length must be C-contiguous");
+    debug_assert!(state_1.is_standard_layout(), "state_1 must be C-contiguous");
+    debug_assert!(state_2.is_standard_layout(), "state_2 must be C-contiguous");
+
+    let outputs = session.run(ort::inputs![
+        "encoder_outputs" => TensorRef::from_array_view(encoder_frame.view())?,
+        "targets" => TensorRef::from_array_view(targets.view())?,
+        "target_length" => TensorRef::from_array_view(target_length.view())?,
+        "input_states_1" => TensorRef::from_array_view(state_1.view())?,
+        "input_states_2" => TensorRef::from_array_view(state_2.view())?
+    ])?;
+
+    let (_l_shape, l_data) = outputs["outputs"]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
+    let logits = Array1::from_vec(l_data.to_vec());
+
+    let (h_shape, h_data) = outputs["output_states_1"]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| Error::Model(format!("Failed to extract state_1: {e}")))?;
+    let (c_shape, c_data) = outputs["output_states_2"]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| Error::Model(format!("Failed to extract state_2: {e}")))?;
+
+    let new_state_1 = Array3::from_shape_vec(
+        (h_shape[0] as usize, h_shape[1] as usize, h_shape[2] as usize),
+        h_data.to_vec(),
+    )
+    .map_err(|e| Error::Model(format!("Failed to reshape state_1: {e}")))?;
+
+    let new_state_2 = Array3::from_shape_vec(
+        (c_shape[0] as usize, c_shape[1] as usize, c_shape[2] as usize),
+        c_data.to_vec(),
+    )
+    .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
+
+    Ok((logits, new_state_1, new_state_2))
 }
 
 #[cfg(test)]
