@@ -55,6 +55,12 @@ realfft = "3"
 
 [dev-dependencies]
 cpal = "0.15"
+criterion = "0.5"
+
+[[bench]]
+name = "transcribe"
+path = "benches/transcribe.rs"
+harness = false
 
 [features]
 default = ["cpu", "ort-defaults"]
