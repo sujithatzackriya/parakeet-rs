@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn auto_defaults_to_cpu_when_no_gpu_feature() {
         // Default build has no accelerator features, so auto() and the default
-        // EP both resolve to Cpu — the default behaviour is unchanged.
+        // EP both resolve to Cpu - the default behaviour is unchanged.
         #[cfg(not(any(
             feature = "cuda",
             feature = "tensorrt",

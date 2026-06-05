@@ -37,7 +37,7 @@ Nemotron multilingual 3.5 (600M, 40 language-locales, vocab 13087):
   are experimental and not in the model card.
 - Files in the same layout (encoder.onnx + .data, decoder_joint.onnx, tokenizer.model)
 - Expects path: ./nemotron_multi
-- Variant is auto-detected at load time — same `Nemotron::from_pretrained` call.
+- Variant is auto-detected at load time - same `Nemotron::from_pretrained` call.
 
 EOU (120M, 17 layers):
 - Download: https://huggingface.co/altunenes/parakeet-rs/tree/main/realtime_eou_120m-v1-onnx

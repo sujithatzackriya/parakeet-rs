@@ -92,7 +92,7 @@ impl Vocabulary {
 }
 
 /// Extract the language code from a SentencePiece piece that encodes a
-/// language tag like `<en-US>` or `<en>` — returns `Some("en-US")` /
+/// language tag like `<en-US>` or `<en>` - returns `Some("en-US")` /
 /// `Some("en")` (brackets stripped) for a tag, `None` otherwise.
 ///
 /// This is the single source of truth for language-tag shape; [`is_lang_tag`]

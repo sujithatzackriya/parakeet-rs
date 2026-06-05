@@ -416,7 +416,7 @@ impl Sortformer {
     /// segments with **absolute** timestamps (accumulated across calls).
     ///
     /// Each successful inference produces `chunk_len * 80ms` worth of predictions
-    /// from exactly one `streaming_update` call — no redundant re-chunking.
+    /// from exactly one `streaming_update` call - no redundant re-chunking.
     ///
     /// # Arguments
     /// * `audio_16k_mono` - Audio samples at 16kHz mono (any length)

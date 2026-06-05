@@ -1,5 +1,5 @@
 /*
-Shared-model demo — load one ONNX session, drive two concurrent streams
+Shared-model demo - load one ONNX session, drive two concurrent streams
 with independent decoder state for streaming models:
 Nemotron (default):
 cargo run --release --example shared_model ./nemotron audio.wav

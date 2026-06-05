@@ -72,7 +72,7 @@ const MAX_DECODE_TOKENS_LIMIT: usize = 1024;
 const DEFAULT_MAX_DECODE_TOKENS: usize = 512;
 
 /// Training chunk length recorded in `preprocessor_config.json`
-/// (`max_audio_clip_s`). This is *not* a runtime limit — the official model
+/// (`max_audio_clip_s`). This is *not* a runtime limit - the official model
 /// card lists long-form transcription as a supported feature and audio well
 /// past this length transcribes fine. Exposed via
 /// [`CohereASR::training_chunk_secs`] only as informational metadata :-)
@@ -227,7 +227,7 @@ fn cohere_preprocessor_config() -> PreprocessorConfig {
 pub struct CohereASR {
     model: CohereModel,
     tokenizer: Tokenizer,
-    /// Mel/STFT parameters (hardcoded — see [`cohere_preprocessor_config`]).
+    /// Mel/STFT parameters (hardcoded - see [`cohere_preprocessor_config`]).
     preprocessor: PreprocessorConfig,
     /// Pre-built mel filterbank + FFT plan ->> reused across every transcribe call.
     feature_cache: FeatureCache,
@@ -300,7 +300,7 @@ impl CohereASR {
     }
 
     /// Training chunk length (in seconds) recorded in the upstream
-    /// `preprocessor_config.json`. Exposed as metadata only — the model
+    /// `preprocessor_config.json`. Exposed as metadata only - the model
     /// card lists long-form transcription as supported and audio longer
     /// than this transcribes fine in practice.
     pub fn training_chunk_secs(&self) -> f32 {

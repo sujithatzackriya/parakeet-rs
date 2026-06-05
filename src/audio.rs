@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// bins, 0.97 preemphasis, additive log guard `2^-24`). These used to be
 /// re-declared verbatim in each module; they live here once so a change can
 /// never drift between variants. The per-variant mel *flavor* (Slaney vs HTK
-/// filterbank) is NOT a constant — it is the filterbank each variant builds and
+/// filterbank) is NOT a constant - it is the filterbank each variant builds and
 /// passes into [`log_mel_spectrogram`].
 pub(crate) mod constants {
     pub const SAMPLE_RATE: usize = 16000;
@@ -32,8 +32,8 @@ pub(crate) mod constants {
 ///
 /// This is the ONE mel front-end body. The per-variant *flavor* enters only
 /// through `mel_basis` (Slaney for Nemotron/Multitalker, HTK for EOU) and the
-/// matching `fft_plan`; every other step — preemphasis, STFT geometry, and the
-/// additive-guard log — is identical and lives here.
+/// matching `fft_plan`; every other step - preemphasis, STFT geometry, and the
+/// additive-guard log - is identical and lives here.
 ///
 /// Returns mel rows x frame columns: `(n_mels, num_frames)`, where `n_mels` is
 /// taken from `mel_basis`. Empty `audio` yields a `(n_mels, 0)` array, matching
@@ -41,7 +41,7 @@ pub(crate) mod constants {
 ///
 /// Numerics note: the historical `multitalker`/`eou` variants applied an
 /// `x.max(0.0)` clamp before the log while `nemotron` did not. The clamp is a
-/// provable no-op — `x = mel_basis.dot(|fft|^2)` is a non-negative matrix times
+/// provable no-op - `x = mel_basis.dot(|fft|^2)` is a non-negative matrix times
 /// a non-negative vector, so `x >= 0` always and `x.max(0.0) == x`. The shared
 /// path drops the clamp; output is byte-identical for all three variants.
 pub(crate) fn log_mel_spectrogram(
@@ -248,7 +248,7 @@ pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) ->
 /// Extract mel spectrogram features from raw audio samples.
 ///
 /// The `cache` holds the mel filterbank and FFT plan built once at model
-/// load — these are deterministic from `config` and identical across calls,
+/// load - these are deterministic from `config` and identical across calls,
 /// so reusing them avoids rebuilding ~15-20 µs of arithmetic per request.
 ///
 /// # Arguments
