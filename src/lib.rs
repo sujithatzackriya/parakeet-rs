@@ -83,12 +83,8 @@ pub use transcriber::*;
 pub use audio::FeatureCache;
 pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
 
-pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
-pub use model::ParakeetModel;
-pub use model_eou::ParakeetEOUModel;
-pub use model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};
-pub use model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
-pub use nemotron::{Nemotron, NemotronHandle, NemotronMode, SentencePieceVocab};
+pub use decoder::{TimedToken, TranscriptionResult};
+pub use nemotron::{Nemotron, NemotronHandle, NemotronMode};
 pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 

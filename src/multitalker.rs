@@ -15,7 +15,7 @@ use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
-use crate::nemotron::SentencePieceVocab;
+use crate::vocab::SentencePieceVocab;
 use crate::sortformer::{Sortformer, NUM_SPEAKERS};
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;

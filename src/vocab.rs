@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// Vocabulary parser for vocab.txt format used by TDT models
@@ -62,5 +62,249 @@ impl Vocabulary {
     /// Get vocabulary size (number of tokens)
     pub fn size(&self) -> usize {
         self.id_to_token.len()
+    }
+}
+
+/// Detect SentencePiece pieces that encode a language tag like `<en-US>` or
+/// `<en>`. The multilingual model emits these inline with text; they're
+/// stripped from the user-visible transcript.
+pub(crate) fn is_lang_tag(piece: &str) -> bool {
+    let bytes = piece.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'<' || bytes[bytes.len() - 1] != b'>' {
+        return false;
+    }
+    let inner = &bytes[1..bytes.len() - 1];
+    match inner.len() {
+        2 => inner[0].is_ascii_lowercase() && inner[1].is_ascii_lowercase(),
+        5 => inner[0].is_ascii_lowercase()
+            && inner[1].is_ascii_lowercase()
+            && inner[2] == b'-'
+            && inner[3].is_ascii_uppercase()
+            && inner[4].is_ascii_uppercase(),
+        _ => false,
+    }
+}
+
+/// Minimal SentencePiece vocabulary loader.
+/// Parses the protobuf .model file to extract token strings.
+/// Note that, our Vocabulary cannot parse protobuf format. I haven't test it with digit spacing yet, at least for this initial impl.
+pub(crate) struct SentencePieceVocab {
+    pub(crate) pieces: Vec<String>,
+}
+
+impl SentencePieceVocab {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut file = File::open(path.as_ref())
+            .map_err(|e| Error::Tokenizer(format!("Failed to open tokenizer.model: {e}")))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .map_err(|e| Error::Tokenizer(format!("Failed to read tokenizer.model: {e}")))?;
+
+        let pieces = Self::parse_sentencepiece_model(&data)?;
+        Ok(Self { pieces })
+    }
+
+    fn parse_sentencepiece_model(data: &[u8]) -> Result<Vec<String>> {
+        let mut pieces = Vec::new();
+        let mut pos = 0;
+
+        while pos < data.len() {
+            let (field_header, bytes_read) = Self::read_varint(&data[pos..])?;
+            pos += bytes_read;
+
+            let field_num = field_header >> 3;
+            let wire_type = field_header & 0x7;
+
+            match (field_num, wire_type) {
+                (1, 2) => {
+                    let (len, bytes_read) = Self::read_varint(&data[pos..])?;
+                    pos += bytes_read;
+
+                    if pos + len as usize > data.len() {
+                        break;
+                    }
+
+                    let piece_data = &data[pos..pos + len as usize];
+                    pos += len as usize;
+
+                    if let Ok(piece) = Self::parse_piece_message(piece_data) {
+                        pieces.push(piece);
+                    }
+                }
+                (_, 0) => {
+                    let (_, bytes_read) = Self::read_varint(&data[pos..])?;
+                    pos += bytes_read;
+                }
+                (_, 1) => pos += 8,
+                (_, 2) => {
+                    let (len, bytes_read) = Self::read_varint(&data[pos..])?;
+                    pos += bytes_read + len as usize;
+                }
+                (_, 5) => pos += 4,
+                _ => break,
+            }
+        }
+
+        if pieces.is_empty() {
+            return Err(Error::Tokenizer("No tokens found in model".into()));
+        }
+
+        Ok(pieces)
+    }
+
+    fn parse_piece_message(data: &[u8]) -> Result<String> {
+        let mut pos = 0;
+        let mut piece = String::new();
+
+        while pos < data.len() {
+            let (field_header, bytes_read) = Self::read_varint(&data[pos..])?;
+            pos += bytes_read;
+
+            let field_num = field_header >> 3;
+            let wire_type = field_header & 0x7;
+
+            match (field_num, wire_type) {
+                (1, 2) => {
+                    let (len, bytes_read) = Self::read_varint(&data[pos..])?;
+                    pos += bytes_read;
+
+                    if pos + len as usize <= data.len() {
+                        piece = String::from_utf8_lossy(&data[pos..pos + len as usize]).to_string();
+                    }
+                    pos += len as usize;
+                }
+                (_, 0) => {
+                    let (_, bytes_read) = Self::read_varint(&data[pos..])?;
+                    pos += bytes_read;
+                }
+                (_, 1) => pos += 8,
+                (_, 2) => {
+                    let (len, bytes_read) = Self::read_varint(&data[pos..])?;
+                    pos += bytes_read + len as usize;
+                }
+                (_, 5) => pos += 4,
+                _ => break,
+            }
+        }
+
+        Ok(piece)
+    }
+
+    fn read_varint(data: &[u8]) -> Result<(u64, usize)> {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        let mut pos = 0;
+
+        while pos < data.len() && pos < 10 {
+            let byte = data[pos];
+            result |= ((byte & 0x7F) as u64) << shift;
+            pos += 1;
+
+            if byte & 0x80 == 0 {
+                return Ok((result, pos));
+            }
+            shift += 7;
+        }
+
+        Err(Error::Tokenizer("Invalid varint".into()))
+    }
+
+    pub fn decode(&self, ids: &[usize]) -> String {
+        let mut result = String::new();
+        for &id in ids {
+            if id < self.pieces.len() {
+                let piece = &self.pieces[id];
+                let decoded = piece.replace('\u{2581}', " ");
+                result.push_str(&decoded);
+            }
+        }
+        result.trim_start().to_string()
+    }
+
+    pub fn decode_single(&self, id: usize) -> String {
+        if id < self.pieces.len() {
+            self.pieces[id].replace('\u{2581}', " ")
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.pieces.len()
+    }
+
+    /// Token IDs whose SentencePiece pieces look like language tags
+    /// (`<en-US>`, `<fr>`, ...). and ofc empty for the en only vocab.
+    pub fn lang_tag_ids(&self) -> Vec<usize> {
+        self.pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| is_lang_tag(p).then_some(i))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_lang_tag ---
+    // The multilingual model emits inline language pieces like `<en>` /
+    // `<en-US>` that must be detected so they can be stripped from the
+    // transcript. This guards the exact byte-pattern matcher.
+
+    #[test]
+    fn is_lang_tag_accepts_two_letter_lowercase() {
+        assert!(is_lang_tag("<en>"));
+        assert!(is_lang_tag("<fr>"));
+        assert!(is_lang_tag("<zh>"));
+    }
+
+    #[test]
+    fn is_lang_tag_accepts_locale_form() {
+        // `<xx-XX>`: lower-lower '-' UPPER-UPPER
+        assert!(is_lang_tag("<en-US>"));
+        assert!(is_lang_tag("<pt-BR>"));
+        assert!(is_lang_tag("<zh-CN>"));
+    }
+
+    #[test]
+    fn is_lang_tag_rejects_malformed() {
+        // Wrong case, wrong shape, missing brackets, too short.
+        assert!(!is_lang_tag("<EN>"), "uppercase 2-letter is not a tag");
+        assert!(!is_lang_tag("<en-us>"), "lowercase locale half is not a tag");
+        assert!(!is_lang_tag("<EN-US>"), "uppercase lang half is not a tag");
+        assert!(!is_lang_tag("<en_US>"), "underscore separator is not a tag");
+        assert!(!is_lang_tag("en-US"), "missing brackets is not a tag");
+        assert!(!is_lang_tag("<e>"), "single inner char (len<4) is not a tag");
+        assert!(!is_lang_tag("<>"), "empty inner is not a tag");
+        assert!(!is_lang_tag("hello"), "plain text is not a tag");
+        assert!(!is_lang_tag("<eng>"), "three-letter inner is not a tag");
+    }
+
+    // --- SentencePieceVocab::lang_tag_ids ---
+    // Pure path over an in-memory piece table (no protobuf, no file IO):
+    // only pieces that look like language tags get collected.
+
+    #[test]
+    fn lang_tag_ids_selects_only_tag_pieces() {
+        let vocab = SentencePieceVocab {
+            pieces: vec![
+                "hello".to_string(),   // 0 - not a tag
+                "<en>".to_string(),    // 1 - tag
+                "world".to_string(),   // 2 - not a tag
+                "<es-ES>".to_string(), // 3 - tag
+                "<EN>".to_string(),    // 4 - not a tag (uppercase)
+            ],
+        };
+        assert_eq!(vocab.lang_tag_ids(), vec![1, 3]);
+    }
+
+    #[test]
+    fn lang_tag_ids_empty_for_plain_vocab() {
+        let vocab = SentencePieceVocab {
+            pieces: vec!["a".to_string(), "b".to_string()],
+        };
+        assert!(vocab.lang_tag_ids().is_empty());
     }
 }
