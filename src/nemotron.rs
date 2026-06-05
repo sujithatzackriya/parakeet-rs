@@ -475,12 +475,60 @@ impl Nemotron {
         // Each CHUNK_SIZE mel frames = CHUNK_SIZE * HOP_LENGTH audio samples
         let processed_mel_frames = self.audio_processed / HOP_LENGTH;
 
-        // Check if we have enough NEW frames to process a chunk
+        // Check if we have enough NEW frames to process a full chunk. Anything
+        // shorter is left buffered for `flush()` to drain at stream end.
         let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
         if available_new_frames < CHUNK_SIZE {
             return Ok(String::new());
         }
 
+        // Interior chunk: always a full CHUNK_SIZE of real frames.
+        self.process_buffered_chunk(&full_mel, total_mel_frames, processed_mel_frames, CHUNK_SIZE)
+    }
+
+    /// Drain any buffered trailing audio shorter than a full chunk at stream
+    /// end and emit the remaining text. Mirrors the offline `transcribe_audio`
+    /// final-chunk handling (true `length`, not a constant), so streaming and
+    /// offline converge on identical audio.
+    ///
+    /// Idempotent: once the tail has been consumed, `audio_processed` covers all
+    /// available mel frames, so a second call finds nothing new and returns "".
+    pub fn flush(&mut self) -> Result<String> {
+        if self.audio_buffer.len() < WIN_LENGTH {
+            return Ok(String::new());
+        }
+
+        let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
+        let total_mel_frames = full_mel.shape()[1];
+        let processed_mel_frames = self.audio_processed / HOP_LENGTH;
+
+        let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
+        // Nothing unprocessed (already flushed, or every frame was a full chunk).
+        if available_new_frames == 0 {
+            return Ok(String::new());
+        }
+
+        // A partial tail (< CHUNK_SIZE) is the case `transcribe_chunk` skips; a
+        // full (or larger) tail can also remain if the caller only ever called
+        // `transcribe_chunk` once with a big buffer. Process exactly the real
+        // frame count, clamped to one encoder window.
+        let main_len = available_new_frames.min(CHUNK_SIZE);
+        self.process_buffered_chunk(&full_mel, total_mel_frames, processed_mel_frames, main_len)
+    }
+
+    /// Encode + decode a single window of `main_len` real mel frames starting at
+    /// `processed_mel_frames`, advancing the processed cursor and accumulating
+    /// tokens. The encoder is given the TRUE length (`PRE_ENCODE_CACHE +
+    /// main_len`) so the final partial window matches the offline convention
+    /// (`transcribe_audio`); for interior windows `main_len == CHUNK_SIZE`, which
+    /// is identical to the previous constant length.
+    fn process_buffered_chunk(
+        &mut self,
+        full_mel: &Array2<f32>,
+        total_mel_frames: usize,
+        processed_mel_frames: usize,
+        main_len: usize,
+    ) -> Result<String> {
         // Build encoder input chunk
         let expected_size = PRE_ENCODE_CACHE + CHUNK_SIZE;
         let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
@@ -488,11 +536,10 @@ impl Nemotron {
         // Determine the mel frame range for this chunk
         let is_first_chunk = self.chunk_idx == 0;
         let main_start = processed_mel_frames;
-        let _main_end = main_start + CHUNK_SIZE;
 
         if is_first_chunk {
             // First chunk: zero-pad for pre-encode cache
-            for f in 0..CHUNK_SIZE.min(total_mel_frames) {
+            for f in 0..main_len.min(total_mel_frames) {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] = full_mel[[m, f]];
                 }
@@ -512,7 +559,7 @@ impl Nemotron {
             }
 
             // Fill main chunk
-            for f in 0..CHUNK_SIZE.min(total_mel_frames - main_start) {
+            for f in 0..main_len.min(total_mel_frames - main_start) {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] =
                         full_mel[[m, main_start + f]];
@@ -523,13 +570,17 @@ impl Nemotron {
         let mel_chunk = Array3::from_shape_vec((1, N_MELS, expected_size), chunk_data)
             .map_err(|e| Error::Model(format!("Failed to create mel chunk: {e}")))?;
 
+        // TRUE length, matching offline `transcribe_audio` (PRE_ENCODE_CACHE +
+        // main_len). For full interior chunks this equals the old `expected_size`.
+        let chunk_length = PRE_ENCODE_CACHE + main_len;
+
         let (encoded, enc_len, new_cache) = {
             let mut model = self.model.lock().map_err(|e| {
                 Error::Model(format!("Failed to acquire model lock: {e}"))
             })?;
             model.run_encoder(
                 &mel_chunk,
-                expected_size as i64,
+                chunk_length as i64,
                 &self.encoder_cache,
                 self.prompt_index,
             )?
@@ -539,8 +590,8 @@ impl Nemotron {
         let tokens = self.decode_chunk(&encoded, enc_len as usize)?;
         self.accumulated_tokens.extend(&tokens);
 
-        // Advance processed position
-        self.audio_processed += CHUNK_SIZE * HOP_LENGTH;
+        // Advance processed position by the REAL frames consumed.
+        self.audio_processed += main_len * HOP_LENGTH;
         self.chunk_idx += 1;
 
         // Trim audio buffer to keep memory bounded

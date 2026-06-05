@@ -72,26 +72,15 @@ fn load_wav_mono(path: &str) -> Vec<f32> {
     audio
 }
 
-/// Drive the streaming path exactly like `examples/streaming.rs`:
-/// 8960-sample chunks (last one zero-padded) + 3x zero-chunk flush, then read
-/// the accumulated transcript.
+/// Drive the streaming path: feed `audio` as 8960-sample chunks WITHOUT
+/// zero-padding the final partial chunk (the genuine tail is left buffered),
+/// then call `flush()` to drain it. This is the T09 contract — `flush()`
+/// replaces the old "zero-pad the last chunk + 3x zero-chunk" incantation.
 fn stream_transcript(model: &mut Nemotron, audio: &[f32]) -> String {
     for chunk in audio.chunks(STREAM_CHUNK) {
-        let chunk_vec = if chunk.len() < STREAM_CHUNK {
-            let mut p = chunk.to_vec();
-            p.resize(STREAM_CHUNK, 0.0);
-            p
-        } else {
-            chunk.to_vec()
-        };
-        model.transcribe_chunk(&chunk_vec).expect("transcribe_chunk");
+        model.transcribe_chunk(chunk).expect("transcribe_chunk");
     }
-    // 3x zero-chunk flush (drains the decoder tail).
-    for _ in 0..3 {
-        model
-            .transcribe_chunk(&vec![0.0; STREAM_CHUNK])
-            .expect("flush chunk");
-    }
+    model.flush().expect("flush");
     model.get_transcript()
 }
 
@@ -106,25 +95,6 @@ fn normalize(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Word-overlap ratio (Jaccard-ish, multiset intersection over the larger set)
-/// of two normalized transcripts. 1.0 == same words.
-fn word_overlap(a: &str, b: &str) -> f64 {
-    let aw: Vec<&str> = a.split_whitespace().collect();
-    let bw: Vec<&str> = b.split_whitespace().collect();
-    if aw.is_empty() && bw.is_empty() {
-        return 1.0;
-    }
-    let mut bw_pool = bw.clone();
-    let mut hits = 0usize;
-    for w in &aw {
-        if let Some(pos) = bw_pool.iter().position(|x| x == w) {
-            bw_pool.remove(pos);
-            hits += 1;
-        }
-    }
-    hits as f64 / aw.len().max(bw.len()) as f64
 }
 
 // ===========================================================================
@@ -150,13 +120,16 @@ fn offline_golden_english() {
 }
 
 // ===========================================================================
-// TEST 2 — STREAMING == OFFLINE EQUIVALENCE (EN), with a documented tolerance.
+// TEST 2 — STREAMING == OFFLINE EQUIVALENCE (EN), byte-equal.
 //
-// Streaming currently (Wave V / M6) drops the final partial chunk and uses a
-// different length convention, so the streaming transcript is NOT byte-equal
-// to the offline one yet. We assert a TOLERANCE (high word-overlap) instead of
-// equality. This tightens to byte-equal after T09 (flush). DO NOT fix flush
-// here.
+// Tightened in T09. With flush() draining the final partial chunk and the
+// streaming encoder length reconciled to the offline convention
+// (PRE_ENCODE_CACHE + real frames), `transcribe_chunk* + flush` produces a
+// BYTE-IDENTICAL transcript to `transcribe_audio` on the same samples. Offline
+// is now a valid oracle for streaming. Verified on ./nemotron + test_en.wav:
+// both render
+//   "...lazy dog. Streaming speech recognition is working correctly."
+// (the trailing '.' that the pre-T09 path dropped is now captured).
 // ===========================================================================
 #[test]
 #[ignore = "needs ./nemotron weights; run with --ignored"]
@@ -177,17 +150,61 @@ fn streaming_matches_offline_english() {
     eprintln!("OFFLINE  : {offline:?}");
     eprintln!("STREAMING: {streaming:?}");
 
-    let overlap = word_overlap(&normalize(&offline), &normalize(&streaming));
-    eprintln!("word_overlap = {overlap:.3}");
-
-    // TOLERANCE: 0.85 word-overlap. Chosen because streaming may lose the final
-    // ~560ms tail (a word or two) until T09 lands flush(); 0.85 catches a real
-    // regression (garbled/empty streaming) while tolerating that known tail
-    // loss. After T09 this assertion should be replaced by byte-equality.
-    assert!(
-        overlap >= 0.85,
-        "streaming diverged from offline beyond tolerance (overlap {overlap:.3} < 0.85)\n\
+    // Byte-equality: streaming (chunks + flush) MUST equal offline on identical
+    // samples. Any drift (a dropped tail word/punctuation, a divergent length
+    // convention, or a flush regression) flips this.
+    assert_eq!(
+        streaming, offline,
+        "streaming (transcribe_chunk* + flush) diverged from offline transcribe_audio\n\
          offline={offline:?}\nstreaming={streaming:?}"
+    );
+}
+
+// ===========================================================================
+// TEST 2b — flush() IDEMPOTENCY + TAIL CAPTURE (T09).
+//
+// Feeds full chunks, leaving a genuine sub-chunk tail buffered, then asserts:
+//   (1) flush() emits NON-EMPTY text (the dropped-tail bug, A1-02, would emit
+//       "" and lose the final word/punctuation), and
+//   (2) a SECOND flush() emits "" and leaves get_transcript() unchanged — no
+//       double-emit, the processed cursor cannot desync.
+// ===========================================================================
+#[test]
+#[ignore = "needs ./nemotron weights; run with --ignored"]
+fn flush_captures_tail_and_is_idempotent() {
+    if !model_present(EN_MODEL_DIR) {
+        eprintln!("SKIP flush_captures_tail_and_is_idempotent: {EN_MODEL_DIR} not present");
+        return;
+    }
+    let audio = load_wav_mono(EN_FIXTURE);
+    // The fixture length is not a multiple of STREAM_CHUNK, so the final
+    // chunk is a partial tail that transcribe_chunk leaves buffered.
+    assert_ne!(audio.len() % STREAM_CHUNK, 0, "fixture must have a partial tail");
+
+    let mut model = Nemotron::from_pretrained(EN_MODEL_DIR, None).expect("load ./nemotron");
+    for chunk in audio.chunks(STREAM_CHUNK) {
+        model.transcribe_chunk(chunk).expect("transcribe_chunk");
+    }
+
+    let first = model.flush().expect("first flush");
+    let after_first = model.get_transcript();
+    eprintln!("first flush emitted: {first:?}");
+
+    let second = model.flush().expect("second flush");
+    let after_second = model.get_transcript();
+    eprintln!("second flush emitted: {second:?}");
+
+    assert!(
+        !first.trim().is_empty(),
+        "flush() must capture the buffered tail (got empty) — dropped-final-chunk regression"
+    );
+    assert_eq!(
+        second, "",
+        "second flush() double-emitted {second:?} — cursor desync / not idempotent"
+    );
+    assert_eq!(
+        after_first, after_second,
+        "second flush() mutated the transcript: {after_first:?} -> {after_second:?}"
     );
 }
 
