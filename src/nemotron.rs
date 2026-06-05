@@ -12,13 +12,9 @@ use std::sync::{Arc, Mutex};
 // Buffer logic and cache slicing strategy derived from:
 // https://github.com/NVIDIA-NeMo/NeMo/blob/main/nemo/collections/asr/parts/utils/streaming_utils.py
 // https://github.com/NVIDIA-NeMo/NeMo/blob/main/nemo/collections/asr/modules/audio_preprocessing.py
-const SAMPLE_RATE: usize = 16000;
-const N_FFT: usize = 512;
-const WIN_LENGTH: usize = 400;
-const HOP_LENGTH: usize = 160;
-const N_MELS: usize = 128;
-const PREEMPH: f32 = 0.97;
-const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+use crate::audio::constants::{
+    HOP_LENGTH, N_FFT, N_MELS, SAMPLE_RATE, WIN_LENGTH,
+};
 
 // Streaming chunk config (identical across English-only and multilingual variants:
 // both use chunk_size_output=7 in NeMo's streaming_cfg which corresponds to 56 mel frames).
@@ -764,16 +760,7 @@ impl Nemotron {
     /// I use capitals because this gave me some trouble on the Python side :(). I realized they dont use it later.
     /// so offc nemo feeding raw log-mel spectrogram values (in decibels) directly to the encoder.
     fn compute_mel_spectrogram(&self, audio: &[f32]) -> Result<Array2<f32>> {
-        if audio.is_empty() {
-            return Ok(Array2::zeros((N_MELS, 0)));
-        }
-
-        let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec =
-            crate::audio::stft_with_plan(&preemph, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
-        let mel = self.mel_basis.dot(&spec);
-
-        Ok(mel.mapv(|x| (x + LOG_ZERO_GUARD).ln()))
+        crate::audio::log_mel_spectrogram(audio, &self.mel_basis, &self.fft_plan)
     }
 }
 

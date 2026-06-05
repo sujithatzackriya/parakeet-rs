@@ -24,14 +24,11 @@ use realfft::RealToComplex;
 use std::path::Path;
 use std::sync::Arc;
 
-// Reuse the same audio constants as Nemotron (same encoder architecture)
-const SAMPLE_RATE: usize = 16000;
-const N_FFT: usize = 512;
-const WIN_LENGTH: usize = 400;
-const HOP_LENGTH: usize = 160;
-const N_MELS: usize = 128;
-const PREEMPH: f32 = 0.97;
-const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+// Same NeMo front-end geometry as Nemotron (same encoder architecture);
+// single-sourced in crate::audio::constants.
+use crate::audio::constants::{
+    HOP_LENGTH, N_FFT, N_MELS, SAMPLE_RATE, WIN_LENGTH,
+};
 
 // Encoder arch (same as Nemotron 0.6B)
 const NUM_ENCODER_LAYERS: usize = 24;
@@ -673,16 +670,7 @@ impl MultitalkerASR {
 
     /// Compute mel spectrogram using shared audio utilities.
     fn compute_mel_spectrogram(&self, audio: &[f32]) -> Result<Array2<f32>> {
-        if audio.is_empty() {
-            return Ok(Array2::zeros((N_MELS, 0)));
-        }
-
-        let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec =
-            crate::audio::stft_with_plan(&preemph, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
-        let mel = self.mel_basis.dot(&spec);
-
-        Ok(mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln()))
+        crate::audio::log_mel_spectrogram(audio, &self.mel_basis, &self.fft_plan)
     }
 }
 

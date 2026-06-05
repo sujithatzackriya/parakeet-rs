@@ -7,6 +7,65 @@ use std::f32::consts::PI;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Single source of truth for the streaming mel front-end constants.
+///
+/// Nemotron, Multitalker, and Parakeet-EOU all run the identical NeMo
+/// front-end geometry (16 kHz, 512-pt FFT, 25 ms window / 10 ms hop, 128 mel
+/// bins, 0.97 preemphasis, additive log guard `2^-24`). These used to be
+/// re-declared verbatim in each module; they live here once so a change can
+/// never drift between variants. The per-variant mel *flavor* (Slaney vs HTK
+/// filterbank) is NOT a constant — it is the filterbank each variant builds and
+/// passes into [`log_mel_spectrogram`].
+pub(crate) mod constants {
+    pub const SAMPLE_RATE: usize = 16000;
+    pub const N_FFT: usize = 512;
+    pub const WIN_LENGTH: usize = 400;
+    pub const HOP_LENGTH: usize = 160;
+    pub const N_MELS: usize = 128;
+    pub const PREEMPH: f32 = 0.97;
+    // NeMo: log_zero_guard_type="add", value = 2^-24.
+    pub const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+}
+
+/// Compute the un-normalized log-mel spectrogram shared by the streaming
+/// variants (Nemotron / Multitalker / Parakeet-EOU).
+///
+/// This is the ONE mel front-end body. The per-variant *flavor* enters only
+/// through `mel_basis` (Slaney for Nemotron/Multitalker, HTK for EOU) and the
+/// matching `fft_plan`; every other step — preemphasis, STFT geometry, and the
+/// additive-guard log — is identical and lives here.
+///
+/// Returns mel rows x frame columns: `(n_mels, num_frames)`, where `n_mels` is
+/// taken from `mel_basis`. Empty `audio` yields a `(n_mels, 0)` array, matching
+/// the previous per-variant guards.
+///
+/// Numerics note: the historical `multitalker`/`eou` variants applied an
+/// `x.max(0.0)` clamp before the log while `nemotron` did not. The clamp is a
+/// provable no-op — `x = mel_basis.dot(|fft|^2)` is a non-negative matrix times
+/// a non-negative vector, so `x >= 0` always and `x.max(0.0) == x`. The shared
+/// path drops the clamp; output is byte-identical for all three variants.
+pub(crate) fn log_mel_spectrogram(
+    audio: &[f32],
+    mel_basis: &Array2<f32>,
+    fft_plan: &Arc<dyn RealToComplex<f32>>,
+) -> Result<Array2<f32>> {
+    let n_mels = mel_basis.shape()[0];
+    if audio.is_empty() {
+        return Ok(Array2::zeros((n_mels, 0)));
+    }
+
+    let preemph = apply_preemphasis(audio, constants::PREEMPH);
+    let spec = stft_with_plan(
+        &preemph,
+        fft_plan,
+        constants::N_FFT,
+        constants::HOP_LENGTH,
+        constants::WIN_LENGTH,
+    )?;
+    let mel = mel_basis.dot(&spec);
+    Ok(mel.mapv(|x| (x + constants::LOG_ZERO_GUARD).ln()))
+}
+
 /// Cached, reusable mel filterbank + FFT plan keyed to a preprocessor
 /// cfgs.
 pub struct FeatureCache {
@@ -425,6 +484,58 @@ mod tests {
             let col = feats.column(feat_idx);
             let mean: f32 = col.iter().sum::<f32>() / num_frames as f32;
             assert!(mean.abs() < 1e-3, "feature {feat_idx} mean {mean} not ~0");
+        }
+    }
+
+    // --- Shared log-mel front-end (log_mel_spectrogram) ---
+
+    #[test]
+    fn log_mel_spectrogram_empty_audio_yields_zero_frames() {
+        // Empty input must return a (n_mels, 0) array, matching the previous
+        // per-variant guards. n_mels is taken from the filterbank.
+        let mel_basis = create_mel_filterbank(512, 128, 16000);
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let plan = planner.plan_fft_forward(512);
+
+        let out = log_mel_spectrogram(&[], &mel_basis, &plan).unwrap();
+        assert_eq!(out.shape(), &[128, 0]);
+    }
+
+    #[test]
+    fn log_mel_spectrogram_clamp_fold_is_byte_identical() {
+        // T13 folded the cosmetic `x.max(0.0)` clamp (multitalker/eou) into the
+        // clamp-free path (nemotron). This is a provable no-op because the mel
+        // energy `mel_basis.dot(|fft|^2)` is always >= 0. Pin it: recomputing
+        // the OLD clamped form by hand must be bit-for-bit identical to the
+        // shared helper's clamp-free output on real (non-trivial) audio.
+        let mel_basis = create_mel_filterbank(512, 128, 16000);
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let plan = planner.plan_fft_forward(512);
+        let audio = sine_wave(440.0, 16000, 8000);
+
+        let shared = log_mel_spectrogram(&audio, &mel_basis, &plan).unwrap();
+
+        // Reconstruct the historical clamped path explicitly.
+        let preemph = apply_preemphasis(&audio, constants::PREEMPH);
+        let spec = stft_with_plan(
+            &preemph,
+            &plan,
+            constants::N_FFT,
+            constants::HOP_LENGTH,
+            constants::WIN_LENGTH,
+        )
+        .unwrap();
+        let clamped = mel_basis
+            .dot(&spec)
+            .mapv(|x| (x.max(0.0) + constants::LOG_ZERO_GUARD).ln());
+
+        assert_eq!(shared.shape(), clamped.shape());
+        for (a, b) in shared.iter().zip(clamped.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "shared clamp-free log-mel must be bit-identical to the old clamped form"
+            );
         }
     }
 

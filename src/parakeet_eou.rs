@@ -7,14 +7,11 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const SAMPLE_RATE: usize = 16000;
+// Shared NeMo front-end geometry, single-sourced in crate::audio::constants.
+use crate::audio::constants::{N_FFT, N_MELS, SAMPLE_RATE};
 
-const N_FFT: usize = 512;
-const WIN_LENGTH: usize = 400;
-const HOP_LENGTH: usize = 160;
-const N_MELS: usize = 128;
-const PREEMPH: f32 = 0.97;
-const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+// EOU intentionally uses an HTK-scale filterbank capped at FMAX (distinct from
+// the Slaney filterbank in audio.rs); this cap is EOU-specific, not shared.
 const FMAX: f32 = 8000.0;
 
 /// Shared handle to a loaded ParakeetEOU model.
@@ -265,11 +262,7 @@ impl ParakeetEOU {
     }
 
     fn extract_mel_features(&self, audio: &[f32]) -> Result<Array3<f32>> {
-        let audio_pre = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec =
-            crate::audio::stft_with_plan(&audio_pre, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
-        let mel = self.mel_basis.dot(&spec);
-        let mel_log = mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln());
+        let mel_log = crate::audio::log_mel_spectrogram(audio, &self.mel_basis, &self.fft_plan)?;
         Ok(mel_log.insert_axis(ndarray::Axis(0)))
     }
 }
