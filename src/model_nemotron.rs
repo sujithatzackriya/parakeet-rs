@@ -93,6 +93,32 @@ impl NemotronModel {
         let mut builder = exec_config.apply_to_session_builder(builder)?;
         let decoder_joint = builder.commit_from_file(&decoder_path)?;
 
+        // Fail fast with a structured error if the export does not expose the
+        // I/O names the encoder/decoder run paths rely on (G-C). `prompt_index`
+        // is intentionally excluded: it is optional (English vs multilingual).
+        crate::error::validate_input_names(
+            &encoder,
+            "nemotron encoder",
+            &[
+                "processed_signal",
+                "processed_signal_length",
+                "cache_last_channel",
+                "cache_last_time",
+                "cache_last_channel_len",
+            ],
+        )?;
+        crate::error::validate_input_names(
+            &decoder_joint,
+            "nemotron decoder_joint",
+            &[
+                "encoder_outputs",
+                "targets",
+                "target_length",
+                "input_states_1",
+                "input_states_2",
+            ],
+        )?;
+
         let mut config = NemotronModelConfig {
             num_encoder_layers: 24,
             hidden_dim: 1024,
