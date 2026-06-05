@@ -1,6 +1,8 @@
+use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
+use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::vocab::{lang_code_from_piece, language_from_tokens, SentencePieceVocab};
 use ndarray::{s, Array2, Array3};
 use realfft::RealToComplex;
@@ -20,6 +22,18 @@ use crate::audio::constants::{
 // both use chunk_size_output=7 in NeMo's streaming_cfg which corresponds to 56 mel frames).
 const CHUNK_SIZE: usize = 56;
 const PRE_ENCODE_CACHE: usize = 9;
+
+// FastConformer subsampling: 56 mel frames -> 7 encoder frames (chunk_size_output),
+// i.e. one encoder output frame spans 8 mel frames. Each mel frame is HOP_LENGTH/
+// SAMPLE_RATE = 10 ms, so one encoder frame is 80 ms. Used only by the additive
+// word-timestamp path to map a committed token's encoder-frame index to seconds.
+const SUBSAMPLING_FACTOR: usize = 8;
+
+/// Encoder-frame index -> seconds. One encoder frame spans
+/// `SUBSAMPLING_FACTOR` mel frames of `HOP_LENGTH` samples each.
+fn encoder_frame_to_seconds(frame: usize) -> f32 {
+    (frame * SUBSAMPLING_FACTOR * HOP_LENGTH) as f32 / SAMPLE_RATE as f32
+}
 
 /// Language → prompt embedding index for the multilingual model. Mirrors
 /// `cfg.model_defaults.prompt_dictionary` from the .nemo. Embedded here so
@@ -177,6 +191,17 @@ pub struct Nemotron {
     audio_processed: usize,
     chunk_idx: usize,
     accumulated_tokens: Vec<usize>,
+    /// Parallel to `accumulated_tokens`: the absolute encoder-frame index at
+    /// which each committed (non-blank) token was emitted. Populated only by the
+    /// streaming path (`process_buffered_chunk`); consumed by the additive
+    /// [`Nemotron::get_timed_transcript`]. The plain-text output never reads it.
+    accumulated_frames: Vec<usize>,
+    /// Monotonic absolute encoder-frame cursor: the index of the NEXT chunk's
+    /// first emitted encoder frame. Advances by each chunk's `enc_len` and is
+    /// NEVER rewound by the audio-buffer trim (unlike `audio_processed`), so the
+    /// per-token frame index stays absolute across the whole stream. Only the
+    /// additive timestamp path reads it.
+    committed_encoder_frames: usize,
 }
 
 impl NemotronHandle {
@@ -312,6 +337,8 @@ impl Nemotron {
             audio_processed: 0,
             chunk_idx: 0,
             accumulated_tokens: Vec::new(),
+            accumulated_frames: Vec::new(),
+            committed_encoder_frames: 0,
         }
     }
 
@@ -403,6 +430,8 @@ impl Nemotron {
         self.audio_processed = 0;
         self.chunk_idx = 0;
         self.accumulated_tokens.clear();
+        self.accumulated_frames.clear();
+        self.committed_encoder_frames = 0;
     }
 
     /// Get the full accumulated transcript. Language tag tokens (e.g. `<en-US>`)
@@ -415,6 +444,43 @@ impl Nemotron {
             .filter(|t| *t < self.vocab_size && !self.lang_tag_ids.contains(t))
             .collect();
         self.vocab.decode(&valid)
+    }
+
+    /// Word- (or token-/sentence-) level timestamps for the **streamed**
+    /// transcript, built from the `(token, encoder-frame)` pairs the decode loop
+    /// accumulates. Additive: `get_transcript()` / `transcribe_chunk()` keep
+    /// returning the same plain `String`; this is a separate, opt-in view.
+    ///
+    /// Each committed non-blank token is timestamped at its encoder frame
+    /// (`frame * SUBSAMPLING_FACTOR * HOP_LENGTH / SAMPLE_RATE` seconds, i.e.
+    /// 80 ms/frame). Language-tag tokens (e.g. `<en-US>`) are skipped, matching
+    /// [`Self::get_transcript`]. With [`TimestampMode::Words`] subword tokens are
+    /// grouped into words via the shared [`process_timestamps`] /
+    /// `group_by_words` logic also used by `parakeet_unified`.
+    ///
+    /// Only the streaming path (`transcribe_chunk` / `flush`) populates the
+    /// timing accumulation; after `transcribe_audio` (offline) the token list is
+    /// not retained in instance state, so this returns an empty result there —
+    /// same as `get_transcript()` would.
+    ///
+    /// Word grouping keys on Latin word boundaries / punctuation; for the
+    /// multilingual variant on non-Latin scripts the per-token timestamps are
+    /// still correct, but word segmentation accuracy degrades.
+    pub fn get_timed_transcript(&self, mode: TimestampMode) -> TranscriptionResult {
+        let text = self.get_transcript();
+        let timed: Vec<TimedToken> = self
+            .accumulated_tokens
+            .iter()
+            .zip(self.accumulated_frames.iter())
+            .filter(|(t, _)| **t < self.vocab_size && !self.lang_tag_ids.contains(t))
+            .map(|(&t, &frame)| TimedToken {
+                text: self.vocab.decode_single(t),
+                start: encoder_frame_to_seconds(frame),
+                end: encoder_frame_to_seconds(frame + 1),
+            })
+            .collect();
+        let tokens = process_timestamps(&timed, mode);
+        TranscriptionResult { text, tokens }
     }
 
     /// The language the multilingual model has most recently identified, as a
@@ -504,8 +570,9 @@ impl Nemotron {
             };
             self.encoder_cache = new_cache;
 
-            let new_tokens = self.decode_chunk(&encoded, enc_len as usize)?;
-            all_tokens.extend(new_tokens);
+            // Offline path does not retain timing; pass offset 0 and keep ids.
+            let new_tokens = self.decode_chunk(&encoded, enc_len as usize, 0)?;
+            all_tokens.extend(new_tokens.into_iter().map(|(id, _)| id));
 
             buffer_idx += CHUNK_SIZE;
             chunk_idx += 1;
@@ -655,8 +722,16 @@ impl Nemotron {
         };
         self.encoder_cache = new_cache;
 
-        let tokens = self.decode_chunk(&encoded, enc_len as usize)?;
-        self.accumulated_tokens.extend(&tokens);
+        // Absolute encoder-frame index of this chunk's first emitted frame.
+        // Tracked by a monotonic cursor (not `audio_processed`, which the buffer
+        // trim below rewinds) so token timestamps stay absolute across the
+        // stream.
+        let frame_offset = self.committed_encoder_frames;
+        let tokens = self.decode_chunk(&encoded, enc_len as usize, frame_offset)?;
+        self.committed_encoder_frames += enc_len as usize;
+        self.accumulated_tokens.extend(tokens.iter().map(|(id, _)| *id));
+        self.accumulated_frames
+            .extend(tokens.iter().map(|(_, frame)| *frame));
 
         // Advance processed position by the REAL frames consumed.
         self.audio_processed += main_len * HOP_LENGTH;
@@ -674,7 +749,7 @@ impl Nemotron {
         }
 
         let mut result = String::new();
-        for &t in &tokens {
+        for &(t, _) in &tokens {
             if t < self.vocab_size && !self.lang_tag_ids.contains(&t) {
                 result.push_str(&self.vocab.decode_single(t));
             }
@@ -682,7 +757,17 @@ impl Nemotron {
         Ok(result)
     }
 
-    fn decode_chunk(&mut self, encoder_out: &Array3<f32>, enc_frames: usize) -> Result<Vec<usize>> {
+    /// Decode the encoder output for one chunk into committed `(token_id,
+    /// absolute_encoder_frame)` pairs. `frame_offset` is the absolute
+    /// encoder-frame index of this chunk's first output frame (0 for the offline
+    /// path, which does not retain timing). The frame index feeds the additive
+    /// word-timestamp path; the plain-text paths only read the token ids.
+    fn decode_chunk(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        enc_frames: usize,
+        frame_offset: usize,
+    ) -> Result<Vec<(usize, usize)>> {
         let mut tokens = Vec::new();
         let hidden_dim = encoder_out.shape()[1];
         let max_symbols_per_step = 10;
@@ -716,7 +801,7 @@ impl Nemotron {
                     break;
                 }
 
-                tokens.push(max_idx);
+                tokens.push((max_idx, frame_offset + t));
                 self.last_token = max_idx as i32;
                 self.state_1 = new_state_1;
                 self.state_2 = new_state_2;
@@ -791,6 +876,17 @@ mod tests {
         );
     }
 
+    // --- encoder_frame_to_seconds: the word-timestamp frame->time mapping ---
+    // One encoder frame spans SUBSAMPLING_FACTOR (8) mel frames of HOP_LENGTH
+    // (160) samples at SAMPLE_RATE (16000), i.e. 80 ms/frame. This is the only
+    // arithmetic the additive get_timed_transcript adds; pin it model-free.
+    #[test]
+    fn encoder_frame_to_seconds_is_80ms_per_frame() {
+        assert_eq!(encoder_frame_to_seconds(0), 0.0);
+        assert!((encoder_frame_to_seconds(1) - 0.08).abs() < 1e-6, "1 frame = 80 ms");
+        assert!((encoder_frame_to_seconds(10) - 0.8).abs() < 1e-6, "10 frames = 800 ms");
+    }
+
     // --- Nemotron::reset() contract (nemotron.rs:495-509) ---
     // This is the language-lock surface. The CURRENT, documented contract is:
     // reset() clears decoder/encoder/audio state for a new utterance but
@@ -843,6 +939,8 @@ mod tests {
             audio_processed: 0,
             chunk_idx: 0,
             accumulated_tokens: Vec::new(),
+            accumulated_frames: Vec::new(),
+            committed_encoder_frames: 0,
         }
     }
 
@@ -858,6 +956,8 @@ mod tests {
         nem.audio_processed = 999;
         nem.chunk_idx = 4;
         nem.accumulated_tokens = vec![1, 2, 3];
+        nem.accumulated_frames = vec![0, 1, 2];
+        nem.committed_encoder_frames = 14;
 
         nem.reset();
 
@@ -868,6 +968,8 @@ mod tests {
         assert_eq!(nem.audio_processed, 0, "audio_processed must reset");
         assert_eq!(nem.chunk_idx, 0, "chunk_idx must reset");
         assert!(nem.accumulated_tokens.is_empty(), "accumulated_tokens cleared");
+        assert!(nem.accumulated_frames.is_empty(), "accumulated_frames cleared");
+        assert_eq!(nem.committed_encoder_frames, 0, "encoder-frame cursor reset");
     }
 
     #[test]

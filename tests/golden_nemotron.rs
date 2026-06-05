@@ -13,7 +13,7 @@
 //! Audio fixture: `tests/fixtures/test_en.wav` (6s, 16kHz mono English),
 //! committed via the `!tests/fixtures/*.wav` .gitignore override.
 
-use parakeet_rs::{Nemotron, NemotronMode};
+use parakeet_rs::{Nemotron, NemotronMode, TimestampMode};
 use std::path::Path;
 
 const EN_MODEL_DIR: &str = "./nemotron";
@@ -387,5 +387,86 @@ fn multilingual_auto_code_switch_acceptance() {
         found.len(),
         spanish_markers.len(),
         found,
+    );
+}
+
+// ===========================================================================
+// TEST 7 — WORD-LEVEL TIMESTAMPS (EN), the T16 gate.
+//
+// Streams ./nemotron over test_en.wav, then calls the additive
+// get_timed_transcript(TimestampMode::Words) and asserts:
+//   (1) words are non-empty,
+//   (2) word start/end timestamps are monotonically non-decreasing and within
+//       the audio duration (~6s, with a small encoder-frame slack), and
+//   (3) the concatenated word text matches get_transcript() modulo spacing/
+//       punctuation (the plain-text path is unchanged; the timed view is built
+//       from the SAME accumulated tokens).
+// ===========================================================================
+#[test]
+#[ignore = "needs ./nemotron weights; run with --ignored"]
+fn word_timestamps_english() {
+    if !model_present(EN_MODEL_DIR) {
+        eprintln!("SKIP word_timestamps_english: {EN_MODEL_DIR} not present");
+        return;
+    }
+    let audio = load_wav_mono(EN_FIXTURE);
+    let audio_secs = audio.len() as f32 / 16000.0;
+
+    let mut model = Nemotron::from_pretrained(EN_MODEL_DIR, None).expect("load ./nemotron");
+    assert_eq!(model.mode(), NemotronMode::EnglishOnly);
+
+    let _ = stream_transcript(&mut model, &audio);
+    let result = model.get_timed_transcript(TimestampMode::Words);
+    let plain = model.get_transcript();
+
+    eprintln!("audio_secs={audio_secs:.2}");
+    eprintln!("plain     : {plain:?}");
+    for w in &result.tokens {
+        eprintln!("  word {:?} [{:.2}, {:.2}]", w.text, w.start, w.end);
+    }
+
+    // (1) Non-empty words.
+    assert!(!result.tokens.is_empty(), "expected non-empty word timestamps");
+
+    // (2) Monotonic non-decreasing starts/ends, each within the audio duration.
+    // Allow one encoder frame (80 ms) of slack on the upper bound: the final
+    // token's `end` is its frame + 1.
+    let slack = 0.1_f32;
+    let mut prev_start = 0.0_f32;
+    let mut prev_end = 0.0_f32;
+    for w in &result.tokens {
+        assert!(w.end >= w.start, "word end < start: {w:?}");
+        assert!(
+            w.start >= prev_start - 1e-4,
+            "word starts not non-decreasing: {} < {}",
+            w.start,
+            prev_start
+        );
+        assert!(
+            w.end >= prev_end - 1e-4,
+            "word ends not non-decreasing: {} < {}",
+            w.end,
+            prev_end
+        );
+        assert!(
+            w.start >= 0.0 && w.end <= audio_secs + slack,
+            "word timestamp out of audio range [0, {:.2}]: {w:?}",
+            audio_secs
+        );
+        prev_start = w.start;
+        prev_end = w.end;
+    }
+
+    // (3) Concatenated word text == plain transcript, modulo spacing/punctuation.
+    let joined = result
+        .tokens
+        .iter()
+        .map(|w| w.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        normalize(&joined),
+        normalize(&plain),
+        "timed word text diverged from plain transcript\njoined={joined:?}\nplain={plain:?}"
     );
 }
