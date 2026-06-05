@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
-use crate::vocab::{language_from_tokens, SentencePieceVocab};
+use crate::vocab::{lang_code_from_piece, language_from_tokens, SentencePieceVocab};
 use ndarray::{s, Array2, Array3};
 use realfft::RealToComplex;
 use std::path::Path;
@@ -72,6 +72,33 @@ const PROMPT_DICTIONARY: &[(&str, i64)] = &[
     ("zu-ZA", 51),
 ];
 
+/// Prompt index for language-agnostic (`"auto"`) decoding. The model picks the
+/// language itself and emits an inline `<lang>` tag per completed sentence.
+const AUTO_PROMPT_INDEX: i64 = 101;
+
+/// Look up the prompt embedding index for a language key (e.g. `"en-US"`,
+/// `"es-ES"`, `"auto"`). Pure: the single source of truth that both
+/// [`Nemotron::set_target_lang`] and the `auto` re-detection path use to map a
+/// language code to its `prompt_index`.
+fn prompt_index_for_lang(lang: &str) -> Option<i64> {
+    PROMPT_DICTIONARY
+        .iter()
+        .find_map(|(k, v)| (*k == lang).then_some(*v))
+}
+
+/// Decide whether decoding under `"auto"` should re-prompt because the model
+/// just emitted a `<lang>` tag for a DIFFERENT language than the one currently
+/// driving the encoder.
+///
+/// Pure decision (no model, no state): returns `Some(new_index)` only when the
+/// detected code maps to a known prompt index that differs from `current`;
+/// `None` when the code is unknown or already the active language (idempotent —
+/// repeated tags for the same language do not trigger a redundant switch).
+fn redetect_prompt_index(current: i64, detected_code: &str) -> Option<i64> {
+    let idx = prompt_index_for_lang(detected_code)?;
+    (idx != current).then_some(idx)
+}
+
 /// Which Nemotron variant a handle wraps. Detected automatically from
 /// the encoder ONNX graph (multilingual exposes a `prompt_index` input).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +168,13 @@ pub struct Nemotron {
     last_token: i32,
     /// `None` for English-only mode; `Some(idx)` for multilingual.
     prompt_index: Option<i64>,
+    /// True when the configured target language is `"auto"`: the model picks the
+    /// language and emits inline `<lang>` tags, and the decode loop re-prompts +
+    /// resets the carried decoder state at each detected language change so the
+    /// next sentence decodes in its own orthography instead of being phonetically
+    /// transliterated. Cleared by any explicit `set_target_lang` to a concrete
+    /// language (the caller has pinned it) and by `reset_with_lang`.
+    auto_redetect: bool,
     /// Raw audio sample buffer for proper mel computation
     audio_buffer: Vec<f32>,
     /// How many audio samples have been processed (converted to mel and sent to encoder)
@@ -252,9 +286,12 @@ impl Nemotron {
         );
 
         let prompt_index = match handle.mode {
-            NemotronMode::Multilingual => Some(101),
+            NemotronMode::Multilingual => Some(AUTO_PROMPT_INDEX),
             NemotronMode::EnglishOnly => None,
         };
+        // Multilingual instances default to `auto`, so in-band re-detection is on
+        // until the caller pins a concrete language via `set_target_lang`.
+        let auto_redetect = handle.mode == NemotronMode::Multilingual;
 
         Self {
             model: Arc::clone(&handle.model),
@@ -274,6 +311,7 @@ impl Nemotron {
             state_2: Array3::zeros((handle.decoder_lstm_layers, 1, handle.decoder_lstm_dim)),
             last_token: handle.blank_id as i32,
             prompt_index,
+            auto_redetect,
             audio_buffer: Vec::new(),
             audio_processed: 0,
             chunk_idx: 0,
@@ -299,24 +337,58 @@ impl Nemotron {
     /// See: https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
     ///
     /// Returns an error on the English-only variant or for an unknown language.
-    /// The new language takes effect on the next encoder call — for clean
-    /// switching mid-utterance you usually also want [`Self::reset`].
+    /// The new prompt takes effect on the **next encoder call** (the carried,
+    /// language-agnostic encoder cache is preserved). Pinning a concrete language
+    /// turns OFF the `"auto"` in-band re-detection; passing `"auto"` turns it
+    /// back on. For a clean switch that also resets the carried decoder state so
+    /// the next chunk decodes fresh in the new language, use
+    /// [`Self::reset_with_lang`].
     pub fn set_target_lang(&mut self, lang: &str) -> Result<()> {
         if self.mode != NemotronMode::Multilingual {
             return Err(Error::Config(
                 "set_target_lang is only available on the multilingual variant".into(),
             ));
         }
-        let idx = PROMPT_DICTIONARY
-            .iter()
-            .find_map(|(k, v)| (*k == lang).then_some(*v))
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "Unknown target language '{lang}'. Try one of: en-US, es-ES, de-DE, fr-FR, ja-JP, zh-CN, auto, ..."
-                ))
-            })?;
+        let idx = prompt_index_for_lang(lang).ok_or_else(|| {
+            Error::Config(format!(
+                "Unknown target language '{lang}'. Try one of: en-US, es-ES, de-DE, fr-FR, ja-JP, zh-CN, auto, ..."
+            ))
+        })?;
         self.prompt_index = Some(idx);
+        self.auto_redetect = lang == "auto";
         Ok(())
+    }
+
+    /// Switch the target language mid-stream at a boundary the caller has
+    /// identified, atomically re-prompting AND resetting the carried decoder
+    /// state so the next chunk decodes fresh in `lang`.
+    ///
+    /// Unlike [`Self::reset`], this **preserves the (language-agnostic) encoder
+    /// cache**, audio buffer, and accumulated transcript — only the
+    /// autoregressive decoder state that self-reinforces the previous language
+    /// (`last_token` and the LSTM states) is cleared. The prompt is applied to
+    /// the encoder *output* via an MLP head, so changing it does not invalidate
+    /// the streaming encoder cache; the decoder reset is what actually breaks the
+    /// previous language's grip.
+    ///
+    /// Pinning a concrete language here turns OFF `"auto"` in-band re-detection;
+    /// passing `"auto"` re-enables it.
+    ///
+    /// Returns an error on the English-only variant or for an unknown language.
+    pub fn reset_with_lang(&mut self, lang: &str) -> Result<()> {
+        self.set_target_lang(lang)?;
+        self.reset_decoder_state();
+        Ok(())
+    }
+
+    /// Reset ONLY the carried autoregressive decoder state (`last_token` -> blank,
+    /// LSTM `state_1`/`state_2` -> 0). Preserves the encoder cache, audio buffer,
+    /// chunk index, and accumulated transcript. This is the atomic state reset a
+    /// language boundary needs so the next decode starts fresh.
+    fn reset_decoder_state(&mut self) {
+        self.last_token = self.blank_id as i32;
+        self.state_1.fill(0.0);
+        self.state_2.fill(0.0);
     }
 
     /// Reset all state for new utterance. Preserves the configured target
@@ -652,6 +724,36 @@ impl Nemotron {
                 self.last_token = max_idx as i32;
                 self.state_1 = new_state_1;
                 self.state_2 = new_state_2;
+
+                // Auto code-switch: under `"auto"`, the model emits an inline
+                // `<lang>` tag per completed sentence — its only in-band boundary
+                // signal. When that tag names a DIFFERENT language than the one
+                // currently driving the encoder, re-prompt to the detected
+                // language (so the next chunk's encoder uses the right language
+                // head) and atomically reset the carried decoder state
+                // (`last_token` + LSTM) so the next sentence decodes fresh rather
+                // than being transliterated into the previous language. The
+                // language-agnostic encoder cache is preserved. Boundary
+                // granularity is the model's per-sentence tag — sub-sentence /
+                // mid-word code-switch is model-inherently unsupported. This is a
+                // no-op for a monolingual stream (the tag matches the active
+                // language), so single-language transcription is unchanged.
+                if self.auto_redetect && self.lang_tag_ids.contains(&max_idx) {
+                    if let Some(code) = self
+                        .vocab
+                        .pieces
+                        .get(max_idx)
+                        .and_then(|p| lang_code_from_piece(p))
+                    {
+                        let current = self.prompt_index.unwrap_or(AUTO_PROMPT_INDEX);
+                        if let Some(new_idx) = redetect_prompt_index(current, &code) {
+                            self.prompt_index = Some(new_idx);
+                            self.last_token = self.blank_id as i32;
+                            self.state_1.fill(0.0);
+                            self.state_2.fill(0.0);
+                        }
+                    }
+                }
             }
         }
 
@@ -748,7 +850,8 @@ mod tests {
             state_1: Array3::zeros((cfg.decoder_lstm_layers, 1, cfg.decoder_lstm_dim)),
             state_2: Array3::zeros((cfg.decoder_lstm_layers, 1, cfg.decoder_lstm_dim)),
             last_token: cfg.blank_id as i32,
-            prompt_index: Some(101),
+            prompt_index: Some(AUTO_PROMPT_INDEX),
+            auto_redetect: true,
             audio_buffer: Vec::new(),
             audio_processed: 0,
             chunk_idx: 0,
@@ -794,6 +897,86 @@ mod tests {
             nem.prompt_index, lang_before,
             "reset() must preserve the configured target language (current documented contract)"
         );
+    }
+
+    // --- redetect_prompt_index: the pure auto code-switch decision ---
+    // Given the currently applied prompt index and a detected <lang> code,
+    // decide whether to re-prompt. This is the heart of the auto code-switch
+    // fix and is fully testable without a model.
+    #[test]
+    fn redetect_prompt_index_switches_on_different_language() {
+        // From auto (101), the first detected language re-prompts to it.
+        assert_eq!(redetect_prompt_index(AUTO_PROMPT_INDEX, "en-US"), Some(0));
+        // English (0) -> Spanish (2): the code-switch that flips the acceptance.
+        assert_eq!(redetect_prompt_index(0, "es-ES"), Some(2));
+    }
+
+    #[test]
+    fn redetect_prompt_index_idempotent_on_same_language() {
+        // Already decoding es-ES (2); another <es-ES> tag must NOT re-switch.
+        assert_eq!(redetect_prompt_index(2, "es-ES"), None);
+        // en (alias of en-US, both index 0) seen while already on 0 -> no switch.
+        assert_eq!(redetect_prompt_index(0, "en"), None);
+    }
+
+    #[test]
+    fn redetect_prompt_index_none_for_unknown_code() {
+        // A malformed / unknown code never triggers a switch.
+        assert_eq!(redetect_prompt_index(0, "zz-ZZ"), None);
+    }
+
+    // --- reset_with_lang: re-prompt + decoder reset, encoder cache preserved ---
+    #[test]
+    fn reset_with_lang_switches_lang_and_resets_decoder_only() {
+        let mut nem = nemotron_for_reset_test();
+        nem.set_target_lang("en-US").unwrap();
+        assert_eq!(nem.prompt_index, Some(0));
+        assert!(!nem.auto_redetect, "concrete lang turns auto off");
+
+        // Dirty the carried decoder state and the encoder cache / audio buffer.
+        nem.state_1.fill(1.0);
+        nem.state_2.fill(1.0);
+        nem.last_token = 7;
+        nem.encoder_cache.cache_last_channel.fill(1.0);
+        nem.audio_buffer = vec![0.5; 32];
+        nem.audio_processed = 999;
+        nem.chunk_idx = 4;
+        nem.accumulated_tokens = vec![1, 2, 3];
+
+        nem.reset_with_lang("es-ES").unwrap();
+
+        // Language switched.
+        assert_eq!(nem.prompt_index, Some(2), "es-ES -> prompt index 2");
+        // Carried DECODER state reset.
+        assert!(nem.state_1.iter().all(|&v| v == 0.0), "state_1 zeroed");
+        assert!(nem.state_2.iter().all(|&v| v == 0.0), "state_2 zeroed");
+        assert_eq!(nem.last_token, nem.blank_id as i32, "last_token -> blank");
+        // Encoder cache, audio buffer, transcript PRESERVED (language-agnostic).
+        assert!(
+            nem.encoder_cache.cache_last_channel.iter().all(|&v| v == 1.0),
+            "encoder cache must be preserved across a language switch"
+        );
+        assert_eq!(nem.audio_buffer.len(), 32, "audio buffer preserved");
+        assert_eq!(nem.audio_processed, 999, "processed cursor preserved");
+        assert_eq!(nem.chunk_idx, 4, "chunk index preserved");
+        assert_eq!(nem.accumulated_tokens, vec![1, 2, 3], "transcript preserved");
+    }
+
+    #[test]
+    fn reset_with_lang_auto_reenables_redetection() {
+        let mut nem = nemotron_for_reset_test();
+        nem.set_target_lang("es-ES").unwrap();
+        assert!(!nem.auto_redetect);
+        nem.reset_with_lang("auto").unwrap();
+        assert_eq!(nem.prompt_index, Some(AUTO_PROMPT_INDEX));
+        assert!(nem.auto_redetect, "auto re-enables in-band re-detection");
+    }
+
+    #[test]
+    fn reset_with_lang_rejects_english_only() {
+        let mut eng = nemotron_for_reset_test();
+        eng.mode = NemotronMode::EnglishOnly;
+        assert!(eng.reset_with_lang("es-ES").is_err());
     }
 
     #[test]
