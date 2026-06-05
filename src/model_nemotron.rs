@@ -85,13 +85,8 @@ impl NemotronModel {
             )));
         }
 
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder_joint = crate::onnx::build_session(&exec_config, &decoder_path)?;
 
         // Fail fast with a structured error if the export does not expose the
         // I/O names the encoder/decoder run paths rely on (G-C). `prompt_index`

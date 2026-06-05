@@ -43,15 +43,8 @@ impl ParakeetTDTModel {
 
         let config = TDTModelConfig::new(vocab_size);
 
-        // Load encoder
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        // Load decoder_joint
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_joint_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder_joint = crate::onnx::build_session(&exec_config, &decoder_joint_path)?;
 
         Ok(Self {
             encoder,
@@ -61,18 +54,18 @@ impl ParakeetTDTModel {
     }
     //file names simply from: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/tree/main
     fn find_encoder(dir: &Path) -> Result<PathBuf> {
+        use crate::onnx::{Precision, Quantization};
         let candidates = [
-            "encoder-model.onnx",
-            "encoder.onnx",
-            "encoder-model.int8.onnx",
+            ("encoder-model.onnx", Precision::Fp32),
+            ("encoder.onnx", Precision::Fp32),
+            ("encoder-model.int8.onnx", Precision::Int8),
         ];
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.exists() {
-                return Ok(path);
-            }
+        if let Ok(path) =
+            crate::onnx::resolve_onnx_file(dir, "encoder", Quantization::Auto, &candidates)
+        {
+            return Ok(path);
         }
-        // fallback
+        // fallback: any encoder*.onnx in the directory
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -90,22 +83,14 @@ impl ParakeetTDTModel {
     }
 
     fn find_decoder_joint(dir: &Path) -> Result<PathBuf> {
+        use crate::onnx::{Precision, Quantization};
         let candidates = [
-            "decoder_joint-model.onnx",
-            "decoder_joint-model.int8.onnx",
-            "decoder_joint.onnx",
-            "decoder-model.onnx",
+            ("decoder_joint-model.onnx", Precision::Fp32),
+            ("decoder_joint-model.int8.onnx", Precision::Int8),
+            ("decoder_joint.onnx", Precision::Fp32),
+            ("decoder-model.onnx", Precision::Fp32),
         ];
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        Err(Error::Config(format!(
-            "No decoder_joint model found in {}",
-            dir.display()
-        )))
+        crate::onnx::resolve_onnx_file(dir, "decoder_joint", Quantization::Auto, &candidates)
     }
 
     /// Run greedy decoding - returns (token_ids, frame_indices, durations)

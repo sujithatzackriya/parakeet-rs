@@ -51,44 +51,29 @@ impl MultitalkerModel {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
-        // Prefer int8 models if available
-        let encoder_path = {
-            let int8 = model_dir.join("encoder.int8.onnx");
-            let fp32 = model_dir.join("encoder.onnx");
-            if int8.exists() {
-                int8
-            } else if fp32.exists() {
-                fp32
-            } else {
-                return Err(Error::Config(format!(
-                    "Missing encoder.onnx or encoder.int8.onnx in {}",
-                    model_dir.display()
-                )));
-            }
-        };
+        // Prefer int8 models if available (historical multitalker behaviour).
+        use crate::onnx::{Precision, Quantization};
+        let encoder_path = crate::onnx::resolve_onnx_file(
+            model_dir,
+            "encoder",
+            Quantization::Int8,
+            &[
+                ("encoder.int8.onnx", Precision::Int8),
+                ("encoder.onnx", Precision::Fp32),
+            ],
+        )?;
+        let decoder_path = crate::onnx::resolve_onnx_file(
+            model_dir,
+            "decoder_joint",
+            Quantization::Int8,
+            &[
+                ("decoder_joint.int8.onnx", Precision::Int8),
+                ("decoder_joint.onnx", Precision::Fp32),
+            ],
+        )?;
 
-        let decoder_path = {
-            let int8 = model_dir.join("decoder_joint.int8.onnx");
-            let fp32 = model_dir.join("decoder_joint.onnx");
-            if int8.exists() {
-                int8
-            } else if fp32.exists() {
-                fp32
-            } else {
-                return Err(Error::Config(format!(
-                    "Missing decoder_joint.onnx or decoder_joint.int8.onnx in {}",
-                    model_dir.display()
-                )));
-            }
-        };
-
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder_joint = crate::onnx::build_session(&exec_config, &decoder_path)?;
 
         Ok(Self {
             encoder,

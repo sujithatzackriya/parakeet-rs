@@ -59,6 +59,7 @@ mod model_nemotron;
 mod model_tdt;
 mod model_unified;
 mod nemotron;
+mod onnx;
 mod parakeet;
 mod parakeet_eou;
 mod parakeet_tdt;

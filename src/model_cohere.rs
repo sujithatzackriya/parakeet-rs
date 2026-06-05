@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use ndarray::{Array1, Array2, Array3, Array4};
 use ort::session::Session;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Cohere Transcribe architecture constants.
 /// Verified against `CohereLabs/cohere-transcribe-03-2026` config and the
@@ -65,40 +65,40 @@ impl CohereModel {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
-        // Try int8 quantised first, then fp32, then fp16. Both flat
-        // (`encoder_model_quantized.onnx` next to the directory root) and
-        // nested (`onnx/encoder_model_quantized.onnx` as in the
-        // onnx-community HF repo) layouts are supported.
-        let encoder_path = Self::find_file(
+        // Try int8 quantised first, then fp32, then fp16 (historical Cohere
+        // behaviour). Both flat (`encoder_model_quantized.onnx` next to the
+        // directory root) and nested (`onnx/encoder_model_quantized.onnx` as in
+        // the onnx-community HF repo) layouts are supported.
+        use crate::onnx::{Precision, Quantization};
+        let encoder_path = crate::onnx::resolve_onnx_file(
             model_dir,
+            "encoder",
+            Quantization::Int8,
             &[
-                "onnx/encoder_model_quantized.onnx",
-                "encoder_model_quantized.onnx",
-                "onnx/encoder_model.onnx",
-                "encoder_model.onnx",
-                "onnx/encoder_model_fp16.onnx",
-                "encoder_model_fp16.onnx",
+                ("onnx/encoder_model_quantized.onnx", Precision::Int8),
+                ("encoder_model_quantized.onnx", Precision::Int8),
+                ("onnx/encoder_model.onnx", Precision::Fp32),
+                ("encoder_model.onnx", Precision::Fp32),
+                ("onnx/encoder_model_fp16.onnx", Precision::Fp16),
+                ("encoder_model_fp16.onnx", Precision::Fp16),
             ],
         )?;
-        let decoder_path = Self::find_file(
+        let decoder_path = crate::onnx::resolve_onnx_file(
             model_dir,
+            "decoder",
+            Quantization::Int8,
             &[
-                "onnx/decoder_model_merged_quantized.onnx",
-                "decoder_model_merged_quantized.onnx",
-                "onnx/decoder_model_merged.onnx",
-                "decoder_model_merged.onnx",
-                "onnx/decoder_model_merged_fp16.onnx",
-                "decoder_model_merged_fp16.onnx",
+                ("onnx/decoder_model_merged_quantized.onnx", Precision::Int8),
+                ("decoder_model_merged_quantized.onnx", Precision::Int8),
+                ("onnx/decoder_model_merged.onnx", Precision::Fp32),
+                ("decoder_model_merged.onnx", Precision::Fp32),
+                ("onnx/decoder_model_merged_fp16.onnx", Precision::Fp16),
+                ("decoder_model_merged_fp16.onnx", Precision::Fp16),
             ],
         )?;
 
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder = builder.commit_from_file(&decoder_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder = crate::onnx::build_session(&exec_config, &decoder_path)?;
 
         Ok(Self { encoder, decoder })
     }
@@ -253,19 +253,6 @@ impl CohereModel {
         Ok((logits, new_past))
     }
 
-    fn find_file(dir: &Path, candidates: &[&str]) -> Result<PathBuf> {
-        for name in candidates {
-            let path = dir.join(name);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-        Err(Error::Config(format!(
-            "None of {:?} found in {}",
-            candidates,
-            dir.display()
-        )))
-    }
 }
 
 /// Extract a 4-D `[1, NUM_KV_HEADS, seq, HEAD_DIM]` cache tensor from the
