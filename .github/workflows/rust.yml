@@ -23,6 +23,61 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  # Compile + test the optional, feature-gated modules and their examples.
+  # Without this, sortformer / multitalker / cohere (and the cohere example)
+  # are never built in CI and can break while the default build stays green.
+  features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - sortformer
+          - multitalker
+          - cohere
+          - "sortformer,multitalker,cohere"
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Build (features + examples)
+      run: cargo build --all-targets --features "${{ matrix.features }}"
+    - name: Test
+      run: cargo test --features "${{ matrix.features }}"
+
+  # Formatting and lint. Non-blocking for now: the existing tree is not yet
+  # fmt/clippy clean, and reformatting it wholesale is out of scope for this
+  # change. Tracked as a follow-up; flip continue-on-error off once clean.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: rustfmt
+      continue-on-error: true
+      run: cargo fmt --all --check
+    - name: clippy
+      continue-on-error: true
+      run: cargo clippy --all-targets --all-features
+
+  # Best-effort compile check for advertised alternate targets / execution
+  # providers, so the surface does not silently rot. Non-blocking: the GPU EP
+  # toolchains are not present on the hosted runner; wasm is the real gate.
+  cross-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust (+ wasm target)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - name: cargo check (wasm32 + webgpu)
+      continue-on-error: true
+      run: cargo check --target wasm32-unknown-unknown --features webgpu
+
   release:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
