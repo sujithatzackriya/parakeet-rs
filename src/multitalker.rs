@@ -13,7 +13,7 @@
 
 use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
 use crate::vocab::SentencePieceVocab;
 use crate::sortformer::{Sortformer, NUM_SPEAKERS};
@@ -52,14 +52,6 @@ const SECONDS_PER_ENCODED_FRAME: f32 = 0.08;
 /// chunk exceeds this probability.
 const SPEAKER_ACTIVITY_THRESHOLD: f32 = 0.3;
 
-/// Word-level timestamp for a single word in a speaker's transcript.
-#[derive(Debug, Clone)]
-pub struct WordTimestamp {
-    pub word: String,
-    pub start_secs: f32,
-    pub end_secs: f32,
-}
-
 /// Per-speaker state for the multi-instance architecture.
 struct SpeakerInstance {
     encoder_cache: MultitalkerEncoderCache,
@@ -94,7 +86,7 @@ impl SpeakerInstance {
 pub struct SpeakerTranscript {
     pub speaker_id: usize,
     pub text: String,
-    pub words: Vec<WordTimestamp>,
+    pub words: Vec<TimedToken>,
 }
 
 /// Streaming latency mode controlling the encoder chunk size.
@@ -647,7 +639,7 @@ impl MultitalkerASR {
     }
 
     /// Convert (token_id, absolute_frame) pairs into word-level timestamps.
-    fn tokens_to_words(&self, tokens: &[(usize, usize)]) -> Vec<WordTimestamp> {
+    fn tokens_to_words(&self, tokens: &[(usize, usize)]) -> Vec<TimedToken> {
         let timed: Vec<TimedToken> = tokens
             .iter()
             .filter(|(id, _)| *id < VOCAB_SIZE)
@@ -659,13 +651,6 @@ impl MultitalkerASR {
             .collect();
 
         timestamps::group_by_words(&timed)
-            .into_iter()
-            .map(|t| WordTimestamp {
-                word: t.text,
-                start_secs: t.start,
-                end_secs: t.end,
-            })
-            .collect()
     }
 
     /// Compute mel spectrogram using shared audio utilities.

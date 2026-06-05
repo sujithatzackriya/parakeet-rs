@@ -81,7 +81,7 @@ mod transcriber;
 mod vocab;
 
 pub use error::{Error, Result};
-pub use execution::{ExecutionProvider, ModelConfig as ExecutionConfig};
+pub use execution::{ExecutionConfig, ExecutionProvider};
 pub use language::Language;
 pub use parakeet::Parakeet;
 pub use parakeet_tdt::ParakeetTDT;
@@ -89,7 +89,7 @@ pub use timestamps::TimestampMode;
 pub use transcriber::Transcriber;
 
 pub use audio::FeatureCache;
-pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
+pub use config::{ModelConfigJson, PreprocessorConfig};
 
 pub use decoder::{TimedToken, TranscriptionResult};
 pub use nemotron::{Nemotron, NemotronHandle, NemotronMode};
@@ -98,7 +98,7 @@ pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStream
 pub use streaming::StreamingTranscriber;
 
 #[cfg(feature = "multitalker")]
-pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript};
 
 #[cfg(feature = "cohere")]
 pub use cohere::{CohereASR, CohereOptions};

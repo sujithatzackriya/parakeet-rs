@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_eou::{EncoderCache, ParakeetEOUModel};
 use ndarray::{s, Array2, Array3};
 use realfft::RealToComplex;
@@ -93,7 +93,7 @@ impl ParakeetEOUHandle {
     /// Required files:
     /// - `encoder.onnx`, `decoder_joint.onnx`
     /// - `tokenizer.json`
-    pub fn load<P: AsRef<Path>>(path: P, config: Option<ExecutionConfig>) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P, exec_config: Option<ExecutionConfig>) -> Result<Self> {
         let path = path.as_ref();
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -107,7 +107,7 @@ impl ParakeetEOUHandle {
             .map(|id| id as i32)
             .unwrap_or(1024);
 
-        let exec_config = config.unwrap_or_default();
+        let exec_config = exec_config.unwrap_or_default();
         let model = ParakeetEOUModel::from_pretrained(path, exec_config)?;
         let mel_basis = create_mel_filterbank_htk();
         let fft_plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
@@ -131,9 +131,9 @@ impl ParakeetEOU {
     /// [`ParakeetEOUHandle::load`] + [`ParakeetEOU::from_shared`] instead.
     pub fn from_pretrained<P: AsRef<Path>>(
         path: P,
-        config: Option<ExecutionConfig>,
+        exec_config: Option<ExecutionConfig>,
     ) -> Result<Self> {
-        Ok(Self::from_shared(&ParakeetEOUHandle::load(path, config)?))
+        Ok(Self::from_shared(&ParakeetEOUHandle::load(path, exec_config)?))
     }
 
     /// Spawn a new ParakeetEOU instance bound to a shared model.

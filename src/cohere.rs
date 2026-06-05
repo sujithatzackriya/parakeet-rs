@@ -27,7 +27,7 @@
 use crate::audio::{extract_features_with_cache, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_cohere::{CohereEncoderOutput, CohereModel, CoherePastKv, N_MELS};
 use ndarray::{Array2, Axis};
 use std::collections::HashMap;

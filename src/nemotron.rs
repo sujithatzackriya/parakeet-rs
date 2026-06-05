@@ -60,7 +60,7 @@
 
 use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::language::Language;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
 use crate::timestamps::{process_timestamps, TimestampMode};

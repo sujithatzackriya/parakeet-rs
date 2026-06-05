@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for transcript in model.get_transcripts() {
         println!("  Speaker {}: {}", transcript.speaker_id, transcript.text);
         for w in &transcript.words {
-            println!("    [{:.2}s - {:.2}s] {}", w.start_secs, w.end_secs, w.word);
+            println!("    [{:.2}s - {:.2}s] {}", w.start, w.end, w.text);
         }
     }
 

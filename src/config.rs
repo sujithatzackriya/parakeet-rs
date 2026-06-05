@@ -16,7 +16,7 @@ pub struct PreprocessorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
+pub struct ModelConfigJson {
     pub architectures: Vec<String>,
     pub vocab_size: usize,
     pub pad_token_id: usize,
@@ -40,7 +40,7 @@ impl Default for PreprocessorConfig {
     }
 }
 
-impl Default for ModelConfig {
+impl Default for ModelConfigJson {
     fn default() -> Self {
         Self {
             architectures: vec!["ParakeetForCTC".to_string()],

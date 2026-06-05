@@ -20,7 +20,7 @@
 //! Note, my stft code is adapted from: https://librosa.org/doc/main/generated/librosa.stft.html
 
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::{s, Array1, Array2, Array3, Axis};
 use ort::session::Session;
 use realfft::RealFftPlanner;
@@ -216,10 +216,10 @@ impl Sortformer {
     /// Create with custom config
     pub fn with_config<P: AsRef<Path>>(
         model_path: P,
-        execution_config: Option<ModelConfig>,
+        exec_config: Option<ExecutionConfig>,
         config: DiarizationConfig,
     ) -> Result<Self> {
-        let config_to_use = execution_config.unwrap_or_default();
+        let config_to_use = exec_config.unwrap_or_default();
 
         let session = crate::onnx::build_session(&config_to_use, model_path.as_ref())?;
 

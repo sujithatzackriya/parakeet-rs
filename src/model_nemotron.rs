@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::{Array1, Array3, Array4};
 use ort::session::{Session, SessionInputValue};
 use ort::value::ValueType;

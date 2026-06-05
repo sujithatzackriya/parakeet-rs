@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::{Array1, Array2, Array3};
 use ort::session::Session;
 use std::path::{Path, PathBuf};

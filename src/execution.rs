@@ -149,7 +149,7 @@ impl ExecutionProvider {
 }
 
 #[derive(Clone)]
-pub struct ModelConfig {
+pub struct ExecutionConfig {
     pub execution_provider: ExecutionProvider,
     pub intra_threads: usize,
     pub inter_threads: usize,
@@ -160,9 +160,9 @@ pub struct ModelConfig {
     pub coreml_cache_dir: Option<PathBuf>,
 }
 
-impl fmt::Debug for ModelConfig {
+impl fmt::Debug for ExecutionConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ModelConfig")
+        f.debug_struct("ExecutionConfig")
             .field("execution_provider", &self.execution_provider)
             .field("intra_threads", &self.intra_threads)
             .field("inter_threads", &self.inter_threads)
@@ -179,7 +179,7 @@ impl fmt::Debug for ModelConfig {
     }
 }
 
-impl Default for ModelConfig {
+impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             execution_provider: ExecutionProvider::default(),
@@ -191,7 +191,7 @@ impl Default for ModelConfig {
     }
 }
 
-impl ModelConfig {
+impl ExecutionConfig {
     pub fn new() -> Self {
         Self::default()
     }
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(providers.len(), expected);
 
         // ExecutionConfig delegate returns the same set.
-        assert_eq!(ModelConfig::compiled_providers(), providers);
+        assert_eq!(ExecutionConfig::compiled_providers(), providers);
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         {
             assert_eq!(ExecutionProvider::auto(), ExecutionProvider::Cpu);
             assert_eq!(
-                ModelConfig::new().with_auto_provider().execution_provider,
+                ExecutionConfig::new().with_auto_provider().execution_provider,
                 ExecutionProvider::Cpu
             );
         }

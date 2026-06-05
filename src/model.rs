@@ -1,13 +1,13 @@
-use crate::config::ModelConfig;
+use crate::config::ModelConfigJson;
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::Array2;
 use ort::session::Session;
 use std::path::Path;
 
 pub struct ParakeetModel {
     session: Session,
-    config: ModelConfig,
+    config: ModelConfigJson,
 }
 
 impl ParakeetModel {
@@ -22,7 +22,7 @@ impl ParakeetModel {
         let model_path = model_path.as_ref();
 
         // Use default config (hardcoded constants for Parakeet-CTC-0.6b: please see: json files https://huggingface.co/onnx-community/parakeet-ctc-0.6b-ONNX/tree/main)
-        let config = ModelConfig::default();
+        let config = ModelConfigJson::default();
 
         let session = crate::onnx::build_session(&exec_config, model_path)?;
 
@@ -77,7 +77,7 @@ impl ParakeetModel {
         Ok(logits_2d)
     }
 
-    pub fn config(&self) -> &ModelConfig {
+    pub fn config(&self) -> &ModelConfigJson {
         &self.config
     }
 
