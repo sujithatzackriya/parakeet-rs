@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 chunk_data.to_vec()
             };
-            let text = model.transcribe(&chunk, false)?;
+            let text = model.transcribe_chunk(&chunk)?;
             if !text.is_empty() {
                 print!("{}", text);
                 std::io::stdout().flush()?;
@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Flush
         for _ in 0..3 {
-            let text = model.transcribe(&vec![0.0; chunk_size], false)?;
+            let text = model.transcribe_chunk(&vec![0.0; chunk_size])?;
             if !text.is_empty() {
                 print!("{}", text);
                 full_text.push_str(&text);

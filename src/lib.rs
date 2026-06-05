@@ -64,6 +64,7 @@ mod parakeet;
 mod parakeet_eou;
 mod parakeet_tdt;
 mod parakeet_unified;
+mod streaming;
 #[cfg(feature = "sortformer")]
 pub mod sortformer;
 #[cfg(feature = "multitalker")]
@@ -92,6 +93,7 @@ pub use decoder::{TimedToken, TranscriptionResult};
 pub use nemotron::{Nemotron, NemotronHandle, NemotronMode};
 pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle, EOU_CHUNK_SAMPLES};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
+pub use streaming::StreamingTranscriber;
 
 #[cfg(feature = "multitalker")]
 pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};

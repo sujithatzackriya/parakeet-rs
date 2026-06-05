@@ -81,8 +81,8 @@ fn run_eou(model_dir: &str, audio: &[f32]) -> Result<(), Box<dyn std::error::Err
         } else {
             chunk_data.to_vec()
         };
-        a_text.push_str(&a.transcribe(&chunk, false)?);
-        b_text.push_str(&b.transcribe(&chunk, false)?);
+        a_text.push_str(&a.transcribe_chunk(&chunk)?);
+        b_text.push_str(&b.transcribe_chunk(&chunk)?);
     }
 
     println!("A: {}", a_text.trim());

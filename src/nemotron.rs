@@ -933,6 +933,25 @@ impl Nemotron {
     }
 }
 
+impl crate::streaming::StreamingTranscriber for Nemotron {
+    type Output = String;
+
+    /// Delegates to the inherent [`Nemotron::transcribe_chunk`].
+    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<String> {
+        Nemotron::transcribe_chunk(self, audio)
+    }
+
+    /// Delegates to the inherent [`Nemotron::reset`] (preserves target language).
+    fn reset(&mut self) {
+        Nemotron::reset(self)
+    }
+
+    /// Delegates to the inherent [`Nemotron::flush`].
+    fn flush(&mut self) -> Result<String> {
+        Nemotron::flush(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

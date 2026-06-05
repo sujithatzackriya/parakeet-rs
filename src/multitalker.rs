@@ -674,6 +674,26 @@ impl MultitalkerASR {
     }
 }
 
+impl crate::streaming::StreamingTranscriber for MultitalkerASR {
+    /// Per-chunk output is one transcript delta per active speaker, not a flat
+    /// `String` like the single-speaker variants.
+    type Output = Vec<SpeakerTranscript>;
+
+    /// Delegates to the inherent [`MultitalkerASR::transcribe_chunk`].
+    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<Vec<SpeakerTranscript>> {
+        MultitalkerASR::transcribe_chunk(self, audio)
+    }
+
+    /// Delegates to the inherent [`MultitalkerASR::reset`].
+    fn reset(&mut self) {
+        MultitalkerASR::reset(self)
+    }
+
+    // No `flush`: the multitalker path carries no sub-chunk trailing buffer to
+    // drain (each chunk runs Sortformer + ASR end to end), so the trait default
+    // (`Ok(Vec::new())`) is correct.
+}
+
 /// Implement the Transcriber trait for single-speaker fallback.
 /// Runs with spk_targets=1.0 and bg_spk_targets=0.0 (no diarisation),
 /// treating the multitalker encoder as a standard streaming ASR encoder.

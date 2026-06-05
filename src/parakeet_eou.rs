@@ -162,6 +162,18 @@ impl ParakeetEOU {
         }
     }
 
+    /// Transcribe a chunk of audio samples (canonical streaming entry point).
+    ///
+    /// Thin wrapper over [`ParakeetEOU::transcribe`] with `reset_on_eou` set to
+    /// `false`, giving EOU the same `transcribe_chunk(&[f32]) -> Result<String>`
+    /// shape as the other streaming variants (and the
+    /// [`StreamingTranscriber`](crate::StreamingTranscriber) trait). Use the
+    /// two-argument [`ParakeetEOU::transcribe`] directly when you want the
+    /// end-of-utterance soft reset.
+    pub fn transcribe_chunk(&mut self, chunk: &[f32]) -> Result<String> {
+        self.transcribe(chunk, false)
+    }
+
     /// Transcribe a chunk of audio samples.
     ///
     /// # Arguments
@@ -300,6 +312,25 @@ impl ParakeetEOU {
         Ok(text_output)
     }
 
+    /// Reset all per-stream state for a NEW utterance: decoder state, encoder
+    /// cache, and the rolling audio buffer. This is the hard reset that matches
+    /// the public `reset()` on the other streaming variants and the
+    /// [`StreamingTranscriber`](crate::StreamingTranscriber) trait.
+    ///
+    /// It is distinct from the in-stream EOU **soft** reset (see
+    /// [`ParakeetEOU::transcribe`] with `reset_on_eou = true`), which
+    /// deliberately preserves the encoder cache and audio buffer so context
+    /// keeps flowing across an end-of-utterance boundary. Call this when you are
+    /// genuinely starting over (e.g. a new file or speaker), not between
+    /// utterances of one continuous stream.
+    pub fn reset(&mut self) {
+        self.encoder_cache = EncoderCache::new();
+        self.state_h.fill(0.0);
+        self.state_c.fill(0.0);
+        self.last_token.fill(self.blank_id);
+        self.audio_buffer.clear();
+    }
+
     fn reset_states(&mut self) {
         // Soft reset: Only reset decoder states
         // at this state, we need to keep encoder cache and audio buffer flowing for continuous context
@@ -314,6 +345,24 @@ impl ParakeetEOU {
         let mel_log = crate::audio::log_mel_spectrogram(audio, &self.mel_basis, &self.fft_plan)?;
         Ok(mel_log.insert_axis(ndarray::Axis(0)))
     }
+}
+
+impl crate::streaming::StreamingTranscriber for ParakeetEOU {
+    type Output = String;
+
+    /// Delegates to the inherent [`ParakeetEOU::transcribe_chunk`]
+    /// (`reset_on_eou = false`).
+    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<String> {
+        ParakeetEOU::transcribe_chunk(self, audio)
+    }
+
+    /// Delegates to the inherent hard [`ParakeetEOU::reset`].
+    fn reset(&mut self) {
+        ParakeetEOU::reset(self)
+    }
+
+    // No `flush`: EOU's rolling-buffer streaming has no separate trailing-window
+    // drain step, so the trait default (`Ok(String::new())`) is correct.
 }
 
 /// HTK mel filterbank used by Parakeet EOU. its distinct from the Slaney-scaled

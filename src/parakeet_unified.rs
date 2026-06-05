@@ -578,6 +578,25 @@ impl Transcriber for ParakeetUnified {
     }
 }
 
+impl crate::streaming::StreamingTranscriber for ParakeetUnified {
+    type Output = String;
+
+    /// Delegates to the inherent [`ParakeetUnified::transcribe_chunk`].
+    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<String> {
+        ParakeetUnified::transcribe_chunk(self, audio)
+    }
+
+    /// Delegates to the inherent [`ParakeetUnified::reset`].
+    fn reset(&mut self) {
+        ParakeetUnified::reset(self)
+    }
+
+    /// Delegates to the inherent [`ParakeetUnified::flush`].
+    fn flush(&mut self) -> Result<String> {
+        ParakeetUnified::flush(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::UnifiedStreamingConfig;
