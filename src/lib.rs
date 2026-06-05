@@ -83,7 +83,7 @@ pub use execution::{ExecutionProvider, ModelConfig as ExecutionConfig};
 pub use parakeet::Parakeet;
 pub use parakeet_tdt::ParakeetTDT;
 pub use timestamps::TimestampMode;
-pub use transcriber::*;
+pub use transcriber::Transcriber;
 
 pub use audio::FeatureCache;
 pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};

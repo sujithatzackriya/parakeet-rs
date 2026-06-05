@@ -137,6 +137,13 @@ impl ParakeetEOU {
     /// * `chunk` - Audio chunk (typically 160ms / 2560 samples at 16kHz)
     /// * `reset_on_eou` - If true, reset decoder state when end-of-utterance is detected
     ///
+    /// # Known limitation (M20)
+    /// The EOU reset is asymmetric: it soft-resets only the decoder state
+    /// (encoder cache and audio buffer keep flowing for continuous context).
+    /// When `reset_on_eou` is set and the model emits `<EOU>`, the loop returns
+    /// immediately, so any non-blank token decoded in that same step is not
+    /// appended. This is intentional for the streaming EOU path.
+    ///
     /// # Streaming Behavior
     /// Cache-aware streaming
     /// - Maintains 4-second ring buffer for feature extraction context

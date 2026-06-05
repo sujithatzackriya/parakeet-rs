@@ -190,15 +190,6 @@ impl ParakeetDecoder {
         })
     }
 
-    // Stub - falls back to greedy decoding. Full beam search with language model is TODO.
-    pub fn decode_with_beam_search(
-        &self,
-        logits: &Array2<f32>,
-        _beam_width: usize,
-    ) -> Result<String> {
-        self.decode(logits)
-    }
-
     pub fn pad_token_id(&self) -> usize {
         self.pad_token_id
     }

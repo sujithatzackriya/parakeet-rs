@@ -329,6 +329,13 @@ impl MultitalkerASR {
     ///
     /// Returns per-speaker text deltas for this chunk. Speakers are created
     /// automatically when first detected.
+    ///
+    /// # Known limitation (M31)
+    /// The ASR chunk (~1.12s in Normal mode) is smaller than Sortformer's
+    /// internal stride (~10s), so the two run at different rates. Sortformer
+    /// pads the short input internally and the resulting speaker masks are
+    /// mapped onto the encoder time axis by nearest-neighbour resampling, which
+    /// can blur speaker boundaries near chunk edges.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<SpeakerTranscript>> {
         self.audio_buffer.extend_from_slice(audio_chunk);
 

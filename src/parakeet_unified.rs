@@ -305,6 +305,13 @@ impl ParakeetUnified {
         self.process_ready_chunks(false)
     }
 
+    /// Drain any buffered audio that has not yet formed a full chunk.
+    ///
+    /// # Known limitation (M22)
+    /// On flush the final chunk may have fewer right-context samples than the
+    /// configured `right_context_secs`. The missing tail is zero-padded rather
+    /// than fed real audio, so the very last chunk sees slightly less future
+    /// context than steady-state chunks. This is a standard streaming tradeoff.
     pub fn flush(&mut self) -> Result<String> {
         self.process_ready_chunks(true)
     }
