@@ -130,6 +130,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Diagnostics: confirm the mic is actually delivering audio.
     let mut total_native: usize = 0;
     let mut peak: f32 = 0.0;
+    // Track the model's in-band language ID (the <lang> tag it emits under
+    // `auto`). Printed whenever it changes so you can see whether the model
+    // actually detects a language switch mid-stream.
+    let mut last_lang: Option<String> = None;
 
     // step = native input samples consumed per output (16kHz) sample.
     let step = native_rate / TARGET_RATE;
@@ -165,6 +169,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
+                let lang = model.detected_language();
+                if lang != last_lang {
+                    eprintln!("\n[detected_language -> {lang:?}]");
+                    last_lang = lang;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -199,6 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ""
         }
     );
+    eprintln!("[final detected_language: {:?}]", model.detected_language());
     println!("\nFinal: {}", model.get_transcript());
     Ok(())
 }
