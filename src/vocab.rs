@@ -3,6 +3,32 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+/// Greedy argmax over a logit slice with ONE policy shared by every decoder.
+///
+/// Policy (unified by T10/M5, previously divergent across variants):
+/// - **First-wins on ties:** the lowest index among equal-maximum values is
+///   returned (matches NeMo greedy semantics).
+/// - **Finite-guard:** non-finite logits (`NaN`, `±inf` that never exceed a
+///   finite running max) are never selected; only finite values can win.
+/// - **Empty / all-non-finite input:** returns `0` (no finite candidate).
+///
+/// This replaces the four-to-six hand-rolled argmaxes that used three
+/// different tie/NaN policies (Nemotron first-wins/NaN-as-token-0, Unified/CTC/
+/// TDT last-wins/NaN-as-Equal, EOU finite-guarded first-wins). Ties and NaN
+/// logits are pathological on real audio, so transcripts are unaffected; the
+/// change only fixes the latent divergence.
+pub(crate) fn argmax(logits: &[f32]) -> usize {
+    let mut max_idx = 0;
+    let mut max_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_finite() && v > max_val {
+            max_val = v;
+            max_idx = i;
+        }
+    }
+    max_idx
+}
+
 /// Vocabulary parser for vocab.txt format used by TDT models
 #[derive(Debug, Clone)]
 pub struct Vocabulary {
@@ -275,6 +301,43 @@ impl SentencePieceVocab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- argmax: the single shared decoder policy (T10/M5) ---
+    // First-wins on ties + finite-guard. This is the one policy every variant
+    // now uses; the per-variant pinning tests (decoder.rs, nemotron.rs) assert
+    // the same behavior through their own call paths.
+
+    #[test]
+    fn argmax_picks_normal_max() {
+        assert_eq!(argmax(&[0.1, 0.5, 0.3, 0.9, 0.2]), 3);
+        assert_eq!(argmax(&[1.0, 0.0, 0.0]), 0);
+    }
+
+    #[test]
+    fn argmax_first_wins_on_ties() {
+        // bins 1 and 3 tie at 0.9 -> the FIRST (lowest index) wins.
+        assert_eq!(argmax(&[0.1, 0.9, 0.2, 0.9]), 1);
+    }
+
+    #[test]
+    fn argmax_all_equal_picks_first() {
+        assert_eq!(argmax(&[0.5, 0.5, 0.5]), 0);
+    }
+
+    #[test]
+    fn argmax_skips_nan() {
+        // A leading NaN must never be selected; the finite max wins.
+        assert_eq!(argmax(&[f32::NAN, 0.2, 0.8, 0.1]), 2);
+        // NaN at the max-value position is skipped in favor of a finite tie.
+        assert_eq!(argmax(&[0.8, f32::NAN, 0.8]), 0);
+    }
+
+    #[test]
+    fn argmax_all_non_finite_or_empty_returns_zero() {
+        assert_eq!(argmax(&[]), 0);
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+        assert_eq!(argmax(&[f32::NEG_INFINITY]), 0);
+    }
 
     // --- is_lang_tag ---
     // The multilingual model emits inline language pieces like `<en>` /

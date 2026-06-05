@@ -474,12 +474,9 @@ impl ParakeetUnified {
                     &self.state_2,
                 )?;
 
-                let token_id = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(self.blank_id);
+                let token_id = crate::vocab::argmax(
+                    logits.as_slice().expect("decoder logits are contiguous"),
+                );
 
                 if token_id == self.blank_id {
                     break;

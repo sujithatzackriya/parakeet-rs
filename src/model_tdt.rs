@@ -228,23 +228,9 @@ impl ParakeetTDTModel {
             let vocab_logits: Vec<f32> = logits_data.iter().take(vocab_size).copied().collect();
             let duration_logits: Vec<f32> = logits_data.iter().skip(vocab_size).copied().collect();
 
-            let token_id = vocab_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(blank_id);
+            let token_id = crate::vocab::argmax(&vocab_logits);
 
-            let duration_step = if !duration_logits.is_empty() {
-                duration_logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            let duration_step = crate::vocab::argmax(&duration_logits);
 
             // Check if blank token
             if token_id != blank_id {

@@ -640,14 +640,9 @@ impl Nemotron {
                     &self.state_2,
                 )?;
 
-                let mut max_idx = 0;
-                let mut max_val = f32::NEG_INFINITY;
-                for (i, &v) in logits.iter().enumerate() {
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = i;
-                    }
-                }
+                let max_idx = crate::vocab::argmax(
+                    logits.as_slice().expect("decoder logits are contiguous"),
+                );
 
                 if max_idx == self.blank_id {
                     break;
@@ -684,25 +679,27 @@ impl Nemotron {
 mod tests {
     use super::*;
 
-    // --- decode_chunk argmax (nemotron.rs:749-756): FIRST max wins on ties ---
-    // Pins the CURRENT, deliberately-divergent argmax used in the Nemotron
-    // decode loop (decoder.rs uses last-wins). Unifying the two is task T10;
-    // this test only documents today's behavior so that change is a conscious
-    // one. The argmax expression is replicated verbatim from decode_chunk
-    // because the loop itself is wrapped around a model call and not callable
-    // without weights.
+    // --- decode_chunk argmax: shared first-wins + finite-guard policy ---
+    // T10 unified every variant's argmax onto `crate::vocab::argmax`
+    // (first-wins on ties + finite-guard). The Nemotron loop was ALREADY
+    // first-wins, so the tie behavior is unchanged; what T10 added here is the
+    // finite-guard (a leading NaN no longer silently decodes as token 0). This
+    // test now asserts the shared helper the loop calls, not a replica.
     #[test]
     fn nemotron_argmax_is_first_wins_on_ties() {
         let logits = [0.1f32, 0.9, 0.2, 0.9]; // bins 1 and 3 tie at 0.9
-        let mut max_idx = 0;
-        let mut max_val = f32::NEG_INFINITY;
-        for (i, &v) in logits.iter().enumerate() {
-            if v > max_val {
-                max_val = v;
-                max_idx = i;
-            }
-        }
-        assert_eq!(max_idx, 1, "nemotron loop must pick the FIRST tied index");
+        assert_eq!(
+            crate::vocab::argmax(&logits),
+            1,
+            "shared argmax must pick the FIRST tied index"
+        );
+        // T10 behavior change: a leading NaN is now skipped instead of
+        // selecting token 0 (the old Nemotron loop had no finite guard).
+        assert_eq!(
+            crate::vocab::argmax(&[f32::NAN, 0.2, 0.8]),
+            2,
+            "shared argmax must skip non-finite logits"
+        );
     }
 
     // --- Nemotron::reset() contract (nemotron.rs:495-509) ---

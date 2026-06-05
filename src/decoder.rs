@@ -45,12 +45,9 @@ impl ParakeetDecoder {
         let mut token_ids = Vec::new();
         for t in 0..time_steps {
             let logits_t = logits.row(t);
-            let max_idx = logits_t
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
+            let max_idx = crate::vocab::argmax(
+                logits_t.as_slice().expect("logits row is contiguous"),
+            );
 
             token_ids.push(max_idx as u32);
         }
@@ -133,12 +130,9 @@ impl ParakeetDecoder {
         let mut token_ids_with_frames = Vec::new();
         for t in 0..time_steps {
             let logits_t = logits.row(t);
-            let max_idx = logits_t
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
+            let max_idx = crate::vocab::argmax(
+                logits_t.as_slice().expect("logits row is contiguous"),
+            );
 
             token_ids_with_frames.push((max_idx as u32, t));
         }
@@ -283,28 +277,22 @@ mod tests {
         assert_eq!(out, vec![(5, 1, 1), (5, 3, 4)]);
     }
 
-    // --- argmax (decoder.rs:48-53, 136-141): max_by => LAST max wins on ties ---
+    // --- argmax: shared first-wins + finite-guard policy ---
 
     #[test]
-    fn decoder_argmax_is_last_wins_on_ties() {
-        // Documents the CURRENT decoder argmax behavior (T10 will unify it):
-        // `max_by` returns the LAST element among equal-maximum values.
-        // Here bins 1 and 3 tie at 0.9; decode must collapse to that argmax.
-        // We exercise it through the public decode-by-argmax path: a single
-        // time step whose argmax is the (last) tied index 3.
+    fn decoder_argmax_is_first_wins_on_ties() {
+        // T10 unified the decoder argmax onto `crate::vocab::argmax`. The
+        // decoder previously used `max_by` (LAST max wins); it now uses the
+        // shared first-wins helper. This is the deliberate T10 behavior change:
+        // on a tie the LOWEST index wins (was the highest). Real ties are
+        // pathological, so golden transcripts are unaffected.
         let d = decoder_with_pad(1024);
         let logits = arr2(&[[0.1f32, 0.9, 0.2, 0.9]]);
-        // Reproduce the decoder's own argmax expression to pin the tie rule.
         let row = logits.row(0);
-        let max_idx = row
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        assert_eq!(max_idx, 3, "decoder max_by must pick the LAST tied index");
+        let max_idx = crate::vocab::argmax(row.as_slice().unwrap());
+        assert_eq!(max_idx, 1, "shared argmax must pick the FIRST tied index");
         // And the full decode path produces exactly one token for one frame.
         let collapsed = d.ctc_collapse(&[max_idx as u32]);
-        assert_eq!(collapsed, vec![3]);
+        assert_eq!(collapsed, vec![1]);
     }
 }

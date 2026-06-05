@@ -213,15 +213,9 @@ impl ParakeetEOU {
                 )?;
 
                 let vocab = logits.slice(s![0, 0, ..]);
-
-                let mut max_idx = 0;
-                let mut max_val = f32::NEG_INFINITY;
-                for (i, &val) in vocab.iter().enumerate() {
-                    if val.is_finite() && val > max_val {
-                        max_val = val;
-                        max_idx = i as i32;
-                    }
-                }
+                let max_idx = crate::vocab::argmax(
+                    vocab.as_slice().expect("decoder logits are contiguous"),
+                ) as i32;
 
                 if max_idx == self.blank_id || max_idx == 0 {
                     break;

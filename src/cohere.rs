@@ -419,14 +419,11 @@ fn find_ngram_repetition(tokens: &[i64], min_len: usize) -> Option<usize> {
     None
 }
 
-/// Greedy argmax over a slice of f32 logits.
+/// Greedy argmax over a slice of f32 logits, returning the token id as `i64`.
+/// Delegates to the single shared decoder policy (first-wins + finite-guard;
+/// unified by T10/M5).
 fn argmax(logits: &[f32]) -> i64 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as i64)
-        .unwrap_or(0)
+    crate::vocab::argmax(logits) as i64
 }
 
 #[cfg(test)]
