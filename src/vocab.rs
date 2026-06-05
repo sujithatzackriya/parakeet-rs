@@ -65,16 +65,19 @@ impl Vocabulary {
     }
 }
 
-/// Detect SentencePiece pieces that encode a language tag like `<en-US>` or
-/// `<en>`. The multilingual model emits these inline with text; they're
-/// stripped from the user-visible transcript.
-pub(crate) fn is_lang_tag(piece: &str) -> bool {
+/// Extract the language code from a SentencePiece piece that encodes a
+/// language tag like `<en-US>` or `<en>` — returns `Some("en-US")` /
+/// `Some("en")` (brackets stripped) for a tag, `None` otherwise.
+///
+/// This is the single source of truth for language-tag shape; [`is_lang_tag`]
+/// delegates to it so detection and code-extraction can never disagree.
+pub(crate) fn lang_code_from_piece(piece: &str) -> Option<String> {
     let bytes = piece.as_bytes();
     if bytes.len() < 4 || bytes[0] != b'<' || bytes[bytes.len() - 1] != b'>' {
-        return false;
+        return None;
     }
     let inner = &bytes[1..bytes.len() - 1];
-    match inner.len() {
+    let ok = match inner.len() {
         2 => inner[0].is_ascii_lowercase() && inner[1].is_ascii_lowercase(),
         5 => inner[0].is_ascii_lowercase()
             && inner[1].is_ascii_lowercase()
@@ -82,7 +85,32 @@ pub(crate) fn is_lang_tag(piece: &str) -> bool {
             && inner[3].is_ascii_uppercase()
             && inner[4].is_ascii_uppercase(),
         _ => false,
-    }
+    };
+    // `inner` is ASCII by construction of `ok`, so the slice is valid UTF-8.
+    ok.then(|| piece[1..piece.len() - 1].to_string())
+}
+
+/// Detect SentencePiece pieces that encode a language tag like `<en-US>` or
+/// `<en>`. The multilingual model emits these inline with text; they're
+/// stripped from the user-visible transcript.
+pub(crate) fn is_lang_tag(piece: &str) -> bool {
+    lang_code_from_piece(piece).is_some()
+}
+
+/// Most-recent language code from a token slice, by EXACT id membership in
+/// `lang_tag_ids` (the precomputed set of vocab ids whose piece is a language
+/// tag). Returns the code (e.g. `"es-ES"`, brackets stripped) of the last
+/// language tag present, or `None` if the slice contains no known tag id.
+///
+/// Pure and model-free: detection is by exact id membership, not a re-run of
+/// the string-shape heuristic, so it is safe to drive control flow from.
+pub(crate) fn language_from_tokens(
+    tokens: &[usize],
+    lang_tag_ids: &[usize],
+    vocab: &SentencePieceVocab,
+) -> Option<String> {
+    let last = tokens.iter().rev().find(|t| lang_tag_ids.contains(t))?;
+    lang_code_from_piece(vocab.pieces.get(*last)?)
 }
 
 /// Minimal SentencePiece vocabulary loader.
@@ -306,5 +334,65 @@ mod tests {
             pieces: vec!["a".to_string(), "b".to_string()],
         };
         assert!(vocab.lang_tag_ids().is_empty());
+    }
+
+    // --- lang_code_from_piece ---
+    // The code extractor is the source of truth `is_lang_tag` delegates to,
+    // so the brackets-stripped code must agree exactly with tag detection.
+
+    #[test]
+    fn lang_code_from_piece_extracts_code_for_tags() {
+        assert_eq!(lang_code_from_piece("<en>").as_deref(), Some("en"));
+        assert_eq!(lang_code_from_piece("<es-ES>").as_deref(), Some("es-ES"));
+        assert_eq!(lang_code_from_piece("<pt-BR>").as_deref(), Some("pt-BR"));
+    }
+
+    #[test]
+    fn lang_code_from_piece_none_for_non_tags() {
+        assert_eq!(lang_code_from_piece("hello"), None);
+        assert_eq!(lang_code_from_piece("<EN>"), None);
+        assert_eq!(lang_code_from_piece("<en_US>"), None);
+        assert_eq!(lang_code_from_piece("<eng>"), None);
+    }
+
+    // --- language_from_tokens (the detected_language() core) ---
+    // Pure, model-free: given exact lang-tag ids, scan a token slice and
+    // return the MOST RECENT tag's code; plain tokens yield None.
+
+    #[test]
+    fn language_from_tokens_returns_most_recent_tag() {
+        let vocab = SentencePieceVocab {
+            pieces: vec![
+                "hello".to_string(),   // 0
+                "<en-US>".to_string(), // 1 - tag
+                "world".to_string(),   // 2
+                "<es-ES>".to_string(), // 3 - tag
+            ],
+        };
+        let lang_tag_ids = vocab.lang_tag_ids(); // [1, 3]
+        // Two tags present: the LAST one (es-ES) wins.
+        let tokens = [0usize, 1, 2, 3, 2];
+        assert_eq!(
+            language_from_tokens(&tokens, &lang_tag_ids, &vocab).as_deref(),
+            Some("es-ES")
+        );
+        // Only the first tag present -> that code.
+        let tokens = [0usize, 1, 2];
+        assert_eq!(
+            language_from_tokens(&tokens, &lang_tag_ids, &vocab).as_deref(),
+            Some("en-US")
+        );
+    }
+
+    #[test]
+    fn language_from_tokens_none_without_tags() {
+        let vocab = SentencePieceVocab {
+            pieces: vec!["hello".to_string(), "<en-US>".to_string(), "world".to_string()],
+        };
+        let lang_tag_ids = vocab.lang_tag_ids(); // [1]
+        // No tag id in the slice -> None (English-only / not yet emitted).
+        assert_eq!(language_from_tokens(&[0usize, 2], &lang_tag_ids, &vocab), None);
+        // Empty lang_tag_ids (the English-only variant) -> always None.
+        assert_eq!(language_from_tokens(&[0usize, 1, 2], &[], &vocab), None);
     }
 }

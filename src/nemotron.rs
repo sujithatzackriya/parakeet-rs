@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
-use crate::vocab::SentencePieceVocab;
+use crate::vocab::{language_from_tokens, SentencePieceVocab};
 use ndarray::{s, Array2, Array3};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -338,6 +338,20 @@ impl Nemotron {
             .filter(|t| *t < self.vocab_size && !self.lang_tag_ids.contains(t))
             .collect();
         self.vocab.decode(&valid)
+    }
+
+    /// The language the multilingual model has most recently identified, as a
+    /// code like `"es-ES"` / `"en-US"` (no angle brackets), or `None` if no
+    /// `<lang>` tag has been emitted yet (or on the English-only variant).
+    ///
+    /// Under `target_lang = "auto"` the multilingual model emits an inline
+    /// `<xx-XX>` SentencePiece tag per completed sentence; those tag tokens are
+    /// kept in state and stripped only at render time, so this reads back the
+    /// model's own per-sentence language ID. It is **read-only observation** —
+    /// it does not change decoding. Acting on a detected switch (re-prompt /
+    /// boundary reset to actually switch language) is a separate, later change.
+    pub fn detected_language(&self) -> Option<String> {
+        language_from_tokens(&self.accumulated_tokens, &self.lang_tag_ids, &self.vocab)
     }
 
     /// note that, offline transcription for testing/debugging and for some curious ppl :-). with following function too (transcribe_audio)

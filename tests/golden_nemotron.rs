@@ -254,6 +254,52 @@ fn reset_clears_streaming_state() {
 }
 
 // ===========================================================================
+// TEST 6 — detected_language() under `auto` (T05).
+//
+// Drives ./nemotron_multi on the English fixture with target_lang="auto" and
+// observes detected_language(). Read-only: this only reads back the model's
+// emitted <lang> tag, it does NOT switch language.
+//
+// NOTE: this is an OBSERVATION test, not a hard assertion. This checkpoint does
+// not emit an inline <lang> tag for a short, clean, monolingual-English clip
+// (verified: the 6s `test_en.wav` yields a correct transcript but no tag, so
+// detected_language() is None here). Tag emission is sentence-boundary /
+// code-switch driven and not guaranteed for every utterance, so asserting
+// `Some(_)` on this fixture would be flaky. The pure id->code mapping that
+// detected_language() is built on is fully covered model-free in
+// `src/vocab.rs` (`language_from_tokens_*`). When a tag IS present we assert it
+// is well-formed (an `xx` / `xx-XX` code); otherwise we only log.
+// ===========================================================================
+#[test]
+#[ignore = "needs ./nemotron_multi weights; run with --ignored"]
+fn multilingual_auto_detected_language_observation() {
+    if !model_present(MULTI_MODEL_DIR) {
+        eprintln!(
+            "SKIP multilingual_auto_detected_language_observation: {MULTI_MODEL_DIR} not present"
+        );
+        return;
+    }
+    let mut model =
+        Nemotron::from_pretrained(MULTI_MODEL_DIR, None).expect("load ./nemotron_multi");
+    model.set_target_lang("auto").expect("set auto");
+
+    let audio = load_wav_mono(EN_FIXTURE);
+    let _ = stream_transcript(&mut model, &audio);
+
+    let detected = model.detected_language();
+    eprintln!("detected_language (auto, en fixture): {detected:?}");
+
+    // Read-only invariant: IF a code is surfaced it must be well-formed
+    // (2-letter lang, optionally `-` + 2-letter region). No tag (None) is a
+    // valid outcome for a short monolingual clip and is not a failure.
+    if let Some(code) = detected {
+        let ok = matches!(code.len(), 2 | 5)
+            && code.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+        assert!(ok, "detected language code is malformed: {code:?}");
+    }
+}
+
+// ===========================================================================
 // TEST 5 — CODE-SWITCH ACCEPTANCE TEST (the T14 gate).
 //
 // ACCEPTANCE TEST for T14 (reset_with_lang / re-prompt). Currently FAILS =
