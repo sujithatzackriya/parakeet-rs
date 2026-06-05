@@ -1,3 +1,63 @@
+//! Nemotron streaming ASR (English-only 0.6B and multilingual 3.5 0.6B).
+//!
+//! # Concurrency model
+//!
+//! Inference is **blocking and serialized through a per-model [`Mutex`]**.
+//! [`Nemotron::transcribe_chunk`] is a synchronous, CPU-bound call: it acquires
+//! the lock on the shared [`NemotronModel`] and holds it for the duration of the
+//! encoder + decoder ONNX runs (~20-50 ms per 560 ms audio chunk). This is **not**
+//! a needless lock - `ort 2.0.0-rc.12`'s `Session::run` takes `&mut self`, so the
+//! `Mutex` is the minimum synchronization required to obtain that `&mut Session`
+//! from the `Arc`-shared model. A `RwLock` would not help (every run still needs a
+//! write lock), and the lock cannot simply be removed.
+//!
+//! ## Implication: shared-model streams do not run inference in parallel
+//!
+//! Multiple [`Nemotron`] instances spawned from one [`NemotronHandle`] via
+//! [`Nemotron::from_shared`] share a single [`Mutex`]-guarded model. Concurrent
+//! chunks from different streams therefore **serialize** on that lock - they do
+//! not execute the encoder/decoder in parallel, even on a multi-core CPU. The
+//! shared handle exists to amortize the one-time ~2.3 GB model load across
+//! streams, not to parallelize inference.
+//!
+//! ## Guidance for async runtimes
+//!
+//! `transcribe_chunk` blocks the calling thread. From an async runtime:
+//!
+//! - **Wrap each call in `spawn_blocking`** (tokio) / `block_in_place` / a
+//!   dedicated thread so the executor stays responsive during the ~20-50 ms run.
+//!   This keeps the runtime healthy; it does **not** parallelize inference (all
+//!   tasks still serialize on the model [`Mutex`]).
+//! - **Use bounded concurrency.** tokio's blocking pool can grow to ~512 threads,
+//!   which oversubscribes a workload whose ONNX intra-op pool is only ~4 threads.
+//!   Cap concurrency with a semaphore or a sized pool, or you will regress under
+//!   contention.
+//! - **Pin each stream to one task.** A [`Nemotron`] carries per-stream `&mut self`
+//!   decode state (encoder cache, LSTM, `last_token`); chunk order *is* decode-state
+//!   order. Never fan one stream's chunks across the blocking pool out of order -
+//!   own the instance in a single task or actor.
+//!
+//! ## Real parallelism: one [`ort`](https://docs.rs/ort) `Session` per stream
+//!
+//! The only way to run inference for multiple streams truly in parallel is to give
+//! each stream its **own** loaded model (one ONNX `Session` per stream) rather than
+//! sharing one through a handle - e.g. construct each via
+//! [`Nemotron::from_pretrained`] instead of [`Nemotron::from_shared`]. Each stream
+//! then owns its `&mut Session` and runs independently. The tradeoff is **memory**:
+//! a fully separate load is N × the ~2.3 GB model resident at once, plus N × the
+//! load time. The shared-handle design deliberately trades this parallelism for a
+//! single amortized load.
+//!
+//! ## Why per-stream state isolation is already safe
+//!
+//! [`NemotronModel`] holds **only** the ONNX `Session`s plus immutable config - no
+//! carried inference state. All mutable per-chunk state (encoder cache, LSTM
+//! `state_1`/`state_2`, `last_token`, audio buffers, accumulated tokens) lives on
+//! the per-stream [`Nemotron`], and [`Nemotron::from_shared`] clones only the
+//! `Arc`s while giving each instance fresh state. So the per-session-per-stream
+//! design above is data-race-safe by construction; the serialization is purely a
+//! consequence of `ort`'s `&mut self` run signature, not of shared mutable state.
+
 use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
@@ -44,7 +104,7 @@ fn encoder_frame_to_seconds(frame: usize) -> f32 {
 ///     hi, ja, ko, vi, uk (with locales).
 ///   - **Broad-coverage (13):** pl, sv, cs, nb, da, bg, fi, hr, sk, zh-CN,
 ///     hu, ro, et.
-///   - **Adaptation-ready (8):** el, lt, lv, mt, sl, he, th, nn — recognized
+///   - **Adaptation-ready (8):** el, lt, lv, mt, sl, he, th, nn - recognized
 ///     by the tokenizer but need fine-tuning for production quality.
 ///
 /// The full dictionary below contains additional entries because (a) several
@@ -102,7 +162,7 @@ fn prompt_index_for_lang(lang: &str) -> Option<i64> {
 ///
 /// Pure decision (no model, no state): returns `Some(new_index)` only when the
 /// detected code maps to a known prompt index that differs from `current`;
-/// `None` when the code is unknown or already the active language (idempotent —
+/// `None` when the code is unknown or already the active language (idempotent -
 /// repeated tags for the same language do not trigger a redundant switch).
 fn redetect_prompt_index(current: i64, detected_code: &str) -> Option<i64> {
     let idx = prompt_index_for_lang(detected_code)?;
@@ -127,6 +187,22 @@ pub enum NemotronMode {
 /// to spawn each stream with its own independent decoder state.
 /// Variant is auto-detected: both the en only 0.6B and the multi lang
 /// 3.5 0.6B drop into the same type.
+///
+/// # Concurrency
+///
+/// The model is wrapped in an `Arc<Mutex<_>>`. Inference is **serialized**: every
+/// stream spawned from this handle locks the same [`Mutex`] for its encoder/decoder
+/// runs, so concurrent chunks do not run in parallel. This is required -
+/// `ort`'s `Session::run` takes `&mut self` - and is intended: the handle amortizes
+/// the one-time ~2.3 GB model load across streams. For true parallel inference,
+/// give each stream its own model (one `Session` per stream) at N × the memory
+/// cost.
+///
+/// From an async runtime, wrap [`Nemotron::transcribe_chunk`] in `spawn_blocking`
+/// (it blocks ~20-50 ms/chunk), use **bounded** concurrency (tokio's blocking pool
+/// can reach ~512 threads vs the ~4-thread ONNX intra-op pool), and **pin each
+/// stream to one task** so chunk order stays equal to decode-state order. See the
+/// `nemotron` module docs (`--document-private-items`) for the full rationale.
 #[derive(Clone)]
 pub struct NemotronHandle {
     model: Arc<Mutex<NemotronModel>>,
@@ -295,9 +371,17 @@ impl Nemotron {
     /// (~20-50 ms per 560 ms audio chunk).
     ///
     /// For the multilingual variant the new instance defaults to `auto`
-    /// (prompt index 101) — the model picks the language itself. Override
+    /// (prompt index 101) - the model picks the language itself. Override
     /// via [`Self::set_target_lang`] when you know the language; that's
     /// strictly more accurate.
+    ///
+    /// **Concurrency:** instances spawned from one handle share a single
+    /// `Mutex`-guarded model, so their [`Self::transcribe_chunk`] calls
+    /// serialize rather than run in parallel. For true parallel inference use a
+    /// separate model per stream (e.g. [`Self::from_pretrained`]) at N × the
+    /// memory cost. From async, wrap `transcribe_chunk` in `spawn_blocking` with
+    /// bounded concurrency and pin each stream to one task. See [`NemotronHandle`]
+    /// for the concurrency summary.
     pub fn from_shared(handle: &NemotronHandle) -> Self {
         let encoder_cache = NemotronEncoderCache::with_dims(
             handle.num_encoder_layers,
@@ -356,7 +440,7 @@ impl Nemotron {
     /// Adaptation-ready locales need fine-tuning for production quality.
     /// The full prompt dictionary accepts additional codes (e.g. `qu-PE`,
     /// `mi-NZ`, `haw-US`) that the model has prompt slots for but are not
-    /// in the model card — those will run, but accuracy is not guaranteed.
+    /// in the model card - those will run, but accuracy is not guaranteed.
     /// See: https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
     ///
     /// Returns an error on the English-only variant or for an unknown language.
@@ -387,7 +471,7 @@ impl Nemotron {
     /// state so the next chunk decodes fresh in `lang`.
     ///
     /// Unlike [`Self::reset`], this **preserves the (language-agnostic) encoder
-    /// cache**, audio buffer, and accumulated transcript — only the
+    /// cache**, audio buffer, and accumulated transcript - only the
     /// autoregressive decoder state that self-reinforces the previous language
     /// (`last_token` and the LSTM states) is cleared. The prompt is applied to
     /// the encoder *output* via an MLP head, so changing it does not invalidate
@@ -460,7 +544,7 @@ impl Nemotron {
     ///
     /// Only the streaming path (`transcribe_chunk` / `flush`) populates the
     /// timing accumulation; after `transcribe_audio` (offline) the token list is
-    /// not retained in instance state, so this returns an empty result there —
+    /// not retained in instance state, so this returns an empty result there -
     /// same as `get_transcript()` would.
     ///
     /// Word grouping keys on Latin word boundaries / punctuation; for the
@@ -490,7 +574,7 @@ impl Nemotron {
     /// Under `target_lang = "auto"` the multilingual model emits an inline
     /// `<xx-XX>` SentencePiece tag per completed sentence; those tag tokens are
     /// kept in state and stripped only at render time, so this reads back the
-    /// model's own per-sentence language ID. It is **read-only observation** —
+    /// model's own per-sentence language ID. It is **read-only observation** -
     /// it does not change decoding. Acting on a detected switch (re-prompt /
     /// boundary reset to actually switch language) is a separate, later change.
     pub fn detected_language(&self) -> Option<String> {
@@ -807,7 +891,7 @@ impl Nemotron {
                 self.state_2 = new_state_2;
 
                 // Auto code-switch: under `"auto"`, the model emits an inline
-                // `<lang>` tag per completed sentence — its only in-band boundary
+                // `<lang>` tag per completed sentence - its only in-band boundary
                 // signal. When that tag names a DIFFERENT language than the one
                 // currently driving the encoder, re-prompt to the detected
                 // language (so the next chunk's encoder uses the right language
@@ -815,7 +899,7 @@ impl Nemotron {
                 // (`last_token` + LSTM) so the next sentence decodes fresh rather
                 // than being transliterated into the previous language. The
                 // language-agnostic encoder cache is preserved. Boundary
-                // granularity is the model's per-sentence tag — sub-sentence /
+                // granularity is the model's per-sentence tag - sub-sentence /
                 // mid-word code-switch is model-inherently unsupported. This is a
                 // no-op for a monolingual stream (the tag matches the active
                 // language), so single-language transcription is unchanged.
@@ -891,7 +975,7 @@ mod tests {
     // This is the language-lock surface. The CURRENT, documented contract is:
     // reset() clears decoder/encoder/audio state for a new utterance but
     // PRESERVES the configured target language (`prompt_index`). These tests
-    // pin that contract as-is — they do NOT assert it is the desired behavior,
+    // pin that contract as-is - they do NOT assert it is the desired behavior,
     // only that a refactor must not silently change which fields reset() touches.
 
     use crate::model_nemotron::{NemotronModel, NemotronModelConfig};
