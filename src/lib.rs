@@ -15,15 +15,19 @@
 //!
 //! ## Quick Start
 //!
-//! ```ignore
+//! ```no_run
 //! use parakeet_rs::{Parakeet, Transcriber, TimestampMode};
 //!
-//! // Load the model
-//! let mut parakeet = Parakeet::from_pretrained(".")?;
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Load the model (pass None for the default CPU execution provider)
+//! let mut parakeet = Parakeet::from_pretrained(".", None)?;
 //!
-//! // Transcribe audio samples (see examples/raw.rs for audio loading)
-//! let result = parakeet.transcribe_samples(audio, sample_rate, channels, Some(TimestampMode::Words))?;
+//! // Transcribe 16kHz mono audio samples (see examples/raw.rs for audio loading)
+//! let audio: Vec<f32> = Vec::new();
+//! let result = parakeet.transcribe_samples(audio, 16000, 1, Some(TimestampMode::Words))?;
 //! println!("Transcription: {}", result.text);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Model Requirements
