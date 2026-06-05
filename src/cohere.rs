@@ -320,7 +320,11 @@ impl CohereASR {
 
     /// Transcribe raw 16 kHz mono f32 audio samples.
     ///
-    /// `language` is an ISO 639-1 code (e.g. `"en"`, `"fr"`, `"de"`, `"ja"`).
+    /// `language` accepts a [`Language`](crate::Language) or, via
+    /// `impl Into<Language>`, a bare ISO 639-1 code string (e.g. `"en"`, `"fr"`,
+    /// `"de"`, `"ja"`). Cohere uses bare ISO codes, not the locale form Nemotron
+    /// uses (`"en-US"`); pass the ISO code (or [`Language::Other`](crate::Language::Other))
+    /// and it resolves through Cohere's supported-language table unchanged.
     /// `punctuation` controls whether output includes punctuation and
     /// capitalisation. `itn` enables inverse text normalisation
     /// (e.g. "twenty three" -> "23").
@@ -339,7 +343,7 @@ impl CohereASR {
     pub fn transcribe_audio(
         &mut self,
         audio: &[f32],
-        language: &str,
+        language: impl Into<crate::Language>,
         punctuation: bool,
         itn: bool,
     ) -> Result<String> {
@@ -363,7 +367,7 @@ impl CohereASR {
     pub fn transcribe_audio_with_options(
         &mut self,
         audio: &[f32],
-        language: &str,
+        language: impl Into<crate::Language>,
         punctuation: bool,
         itn: bool,
         options: CohereOptions,
@@ -372,10 +376,12 @@ impl CohereASR {
             return Ok(String::new());
         }
 
-        let lang_token = self.lang_tokens.get(language).copied().ok_or_else(|| {
+        let language = language.into();
+        let code = language.as_str();
+        let lang_token = self.lang_tokens.get(code).copied().ok_or_else(|| {
             Error::Config(format!(
                 "Unsupported language '{}'. Supported: {:?}",
-                language,
+                code,
                 self.supported_languages()
             ))
         })?;

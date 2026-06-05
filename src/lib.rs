@@ -53,6 +53,7 @@ mod decoder;
 mod decoder_tdt;
 mod error;
 mod execution;
+mod language;
 mod model;
 mod model_eou;
 mod model_nemotron;
@@ -81,6 +82,7 @@ mod vocab;
 
 pub use error::{Error, Result};
 pub use execution::{ExecutionProvider, ModelConfig as ExecutionConfig};
+pub use language::Language;
 pub use parakeet::Parakeet;
 pub use parakeet_tdt::ParakeetTDT;
 pub use timestamps::TimestampMode;

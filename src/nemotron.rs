@@ -61,6 +61,7 @@
 use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
+use crate::language::Language;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::vocab::{lang_code_from_piece, language_from_tokens, SentencePieceVocab};
@@ -431,9 +432,12 @@ impl Nemotron {
         self.mode
     }
 
-    /// Set the target language for the multilingual model. Accepts any key
-    /// from [`NemotronHandle::available_languages`] (e.g. `"en-US"`, `"es-ES"`,
-    /// `"ja-JP"`, `"auto"` for language-agnostic decoding).
+    /// Set the target language for the multilingual model. Accepts a typed
+    /// [`Language`] or, via `impl Into<Language>`, a code string from
+    /// [`NemotronHandle::available_languages`] (e.g. `"en-US"`, `"es-ES"`,
+    /// `"ja-JP"`, `"auto"` / [`Language::Auto`] for language-agnostic decoding).
+    /// Both forms resolve to the same prompt index, so existing
+    /// `set_target_lang("ja-JP")` call sites keep working unchanged.
     ///
     /// **Quality note:** NVIDIA's model card documents 40 language-locales
     /// across 3 tiers (transcription-ready, broad-coverage, adaptation-ready).
@@ -446,23 +450,25 @@ impl Nemotron {
     /// Returns an error on the English-only variant or for an unknown language.
     /// The new prompt takes effect on the **next encoder call** (the carried,
     /// language-agnostic encoder cache is preserved). Pinning a concrete language
-    /// turns OFF the `"auto"` in-band re-detection; passing `"auto"` turns it
-    /// back on. For a clean switch that also resets the carried decoder state so
-    /// the next chunk decodes fresh in the new language, use
+    /// turns OFF the `"auto"` in-band re-detection; passing [`Language::Auto`]
+    /// turns it back on. For a clean switch that also resets the carried decoder
+    /// state so the next chunk decodes fresh in the new language, use
     /// [`Self::reset_with_lang`].
-    pub fn set_target_lang(&mut self, lang: &str) -> Result<()> {
+    pub fn set_target_lang(&mut self, lang: impl Into<Language>) -> Result<()> {
         if self.mode != NemotronMode::Multilingual {
             return Err(Error::Config(
                 "set_target_lang is only available on the multilingual variant".into(),
             ));
         }
-        let idx = prompt_index_for_lang(lang).ok_or_else(|| {
+        let lang = lang.into();
+        let code = lang.as_str();
+        let idx = prompt_index_for_lang(code).ok_or_else(|| {
             Error::Config(format!(
-                "Unknown target language '{lang}'. Try one of: en-US, es-ES, de-DE, fr-FR, ja-JP, zh-CN, auto, ..."
+                "Unknown target language '{code}'. Try one of: en-US, es-ES, de-DE, fr-FR, ja-JP, zh-CN, auto, ..."
             ))
         })?;
         self.prompt_index = Some(idx);
-        self.auto_redetect = lang == "auto";
+        self.auto_redetect = lang == Language::Auto;
         Ok(())
     }
 
@@ -479,10 +485,11 @@ impl Nemotron {
     /// previous language's grip.
     ///
     /// Pinning a concrete language here turns OFF `"auto"` in-band re-detection;
-    /// passing `"auto"` re-enables it.
+    /// passing [`Language::Auto`] (or `"auto"`) re-enables it. Accepts a typed
+    /// [`Language`] or a code string via `impl Into<Language>`.
     ///
     /// Returns an error on the English-only variant or for an unknown language.
-    pub fn reset_with_lang(&mut self, lang: &str) -> Result<()> {
+    pub fn reset_with_lang(&mut self, lang: impl Into<Language>) -> Result<()> {
         self.set_target_lang(lang)?;
         self.reset_decoder_state();
         Ok(())
@@ -579,6 +586,16 @@ impl Nemotron {
     /// boundary reset to actually switch language) is a separate, later change.
     pub fn detected_language(&self) -> Option<String> {
         language_from_tokens(&self.accumulated_tokens, &self.lang_tag_ids, &self.vocab)
+    }
+
+    /// Same as [`Self::detected_language`] but typed: the most recently
+    /// identified language as a [`Language`] (e.g. [`Language::Spanish`]), or
+    /// `None` if no `<lang>` tag has been emitted yet. Additive accessor; the
+    /// `String` form is unchanged. The code string is mapped through
+    /// [`Language::from`], so an enumerated locale becomes its named variant and
+    /// any other code is carried verbatim in [`Language::Other`].
+    pub fn detected_language_typed(&self) -> Option<Language> {
+        self.detected_language().map(Language::from)
     }
 
     /// note that, offline transcription for testing/debugging and for some curious ppl :-). with following function too (transcribe_audio)
@@ -1169,6 +1186,63 @@ mod tests {
         let mut eng = nemotron_for_reset_test();
         eng.mode = NemotronMode::EnglishOnly;
         assert!(eng.reset_with_lang("es-ES").is_err());
+    }
+
+    // --- T17: typed Language resolves to the SAME prompt_index as the raw &str ---
+    // Behavior-preserving guarantee: a Language and its code string both look up
+    // the identical PROMPT_DICTIONARY entry, so set_target_lang(Language::X) and
+    // set_target_lang("x-code") drive the same prompt head.
+
+    #[test]
+    fn language_auto_maps_to_prompt_index_101() {
+        // Auto is first-class and resolves to the documented auto slot (101).
+        assert_eq!(Language::Auto.as_str(), "auto");
+        assert_eq!(prompt_index_for_lang(Language::Auto.as_str()), Some(101));
+        assert_eq!(AUTO_PROMPT_INDEX, 101);
+    }
+
+    #[test]
+    fn typed_language_resolves_same_prompt_index_as_str() {
+        // Each named locale must resolve through as_str() to the exact same
+        // prompt index the raw code string resolves to in PROMPT_DICTIONARY.
+        let cases = [
+            (Language::English, "en-US"),
+            (Language::Spanish, "es-ES"),
+            (Language::Japanese, "ja-JP"),
+            (Language::Hindi, "hi-IN"),
+            (Language::Chinese, "zh-CN"),
+        ];
+        for (lang, code) in cases {
+            let via_type = prompt_index_for_lang(lang.as_str());
+            let via_str = prompt_index_for_lang(code);
+            assert!(via_str.is_some(), "{code} must exist in PROMPT_DICTIONARY");
+            assert_eq!(via_type, via_str, "{lang:?} must resolve like \"{code}\"");
+        }
+    }
+
+    #[test]
+    fn set_target_lang_accepts_typed_and_str_identically() {
+        // The two call forms must end on the same prompt_index (additive &str).
+        let mut a = nemotron_for_reset_test();
+        let mut b = nemotron_for_reset_test();
+        a.set_target_lang("es-ES").unwrap();
+        b.set_target_lang(Language::Spanish).unwrap();
+        assert_eq!(a.prompt_index, b.prompt_index);
+        assert_eq!(a.prompt_index, Some(2));
+    }
+
+    #[test]
+    fn set_target_lang_other_passthrough_matches_str_behavior() {
+        // An un-enumerated but valid dictionary code (alias "en") must still
+        // resolve via Language::Other exactly as the bare &str did, and an
+        // unknown code must still error - matching the pre-T17 behavior.
+        let mut nem = nemotron_for_reset_test();
+        nem.set_target_lang("en").unwrap(); // alias of en -> index 0
+        assert_eq!(nem.prompt_index, Some(0));
+        assert!(
+            nem.set_target_lang(Language::Other("zz-ZZ".into())).is_err(),
+            "unknown Other(code) must error like the unknown &str did"
+        );
     }
 
     #[test]
