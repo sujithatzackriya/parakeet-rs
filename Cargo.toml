@@ -53,6 +53,7 @@ serde_json = "1.0"
 realfft = "3"
 
 [dev-dependencies]
+cpal = "0.15"
 
 [features]
 default = ["cpu", "ort-defaults"]
