@@ -55,10 +55,10 @@ for chunk in audio.chunks(CHUNK_SIZE) {
 }
 ```
 
-**Nemotron (Streaming)**: Cache-aware streaming ASR with punctuation. Two variants share the same API — point `from_pretrained` at whatever directory holds the ONNX files and the loader auto-detects which variant it is:
+**Nemotron (Streaming)**: Cache-aware streaming ASR with punctuation. Two variants share the same API - point `from_pretrained` at whatever directory holds the ONNX files and the loader auto-detects which variant it is:
 
-- **English-only 0.6B** — verbatim English, preserves disfluencies (`um`, `uh`). Best for transcription where every spoken word matters.
-- **Multilingual 3.5 0.6B** — [40 language-locales](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) across 3 tiers (19 transcription-ready, 13 broad-coverage, 8 that need fine-tuning to reach production quality based on the NVIDIA). Polished output (proper casing/punctuation, drops disfluencies). Same speed and size as the English-only model.
+- **English-only 0.6B** - verbatim English, preserves disfluencies (`um`, `uh`). Best for transcription where every spoken word matters.
+- **Multilingual 3.5 0.6B** - [40 language-locales](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) across 3 tiers (19 transcription-ready, 13 broad-coverage, 8 that need fine-tuning to reach production quality based on the NVIDIA). Polished output (proper casing/punctuation, drops disfluencies). Same speed and size as the English-only model.
 
 ```rust
 use parakeet_rs::{Nemotron, NemotronMode};
@@ -200,6 +200,22 @@ let config = ExecutionConfig::new()
 
 - Audio: 16kHz mono WAV (16-bit PCM or 32-bit float)
 - CTC/TDT models have ~4-5 minute audio length limit. For longer files, use streaming models or split into chunks
+
+## Concurrency
+
+Inference is **blocking and serialized through a per-model `Mutex`**. `transcribe_chunk` is synchronous and CPU-bound; it locks the shared model for the encoder/decoder ONNX runs (~20-50 ms per 560 ms chunk). The lock is required, not incidental: `ort 2.0.0-rc.12`'s `Session::run` takes `&mut self`, so the `Mutex` is the minimum synchronization needed to obtain `&mut Session` from the `Arc`-shared model. It cannot simply be removed.
+
+A consequence: multiple streams spawned from one `NemotronHandle` via `from_shared` share that single `Mutex`, so their chunks **serialize** - they do not run inference in parallel, even on a multi-core CPU. The shared handle exists to amortize the one-time ~2.3 GB model load across streams, not to parallelize inference.
+
+**From an async runtime:**
+
+- Wrap each `transcribe_chunk` call in `spawn_blocking` (tokio) / `block_in_place` / a dedicated thread so the executor stays responsive during the run. This keeps the runtime healthy; it does not parallelize inference.
+- Use **bounded** concurrency. tokio's blocking pool can grow to ~512 threads, oversubscribing a workload whose ONNX intra-op pool is only ~4 threads. Cap it with a semaphore or a sized pool.
+- **Pin each stream to one task.** Each instance carries per-stream decode state (encoder cache, LSTM, last token); chunk order is decode-state order. Never fan one stream's chunks across the blocking pool out of order.
+
+**For real parallel inference,** give each stream its own loaded model (one ONNX `Session` per stream) instead of sharing a handle - e.g. construct each via `from_pretrained` rather than `from_shared`. Each stream then owns its `&mut Session` and runs independently. The tradeoff is memory: a separate load is N × the ~2.3 GB model resident at once, plus N × the load time.
+
+Per-stream state isolation is already data-race-safe: the shared model holds only the ONNX sessions and immutable config, while all mutable per-chunk state lives on the per-stream instance (`from_shared` clones only the `Arc`s and gives each instance fresh state). The serialization is purely a consequence of `ort`'s `&mut self` run signature, not of shared mutable state.
 
 ## License
 

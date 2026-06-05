@@ -2,9 +2,9 @@ use crate::audio::{self, load_audio};
 use crate::config::PreprocessorConfig;
 use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
-use crate::nemotron::SentencePieceVocab;
+use crate::vocab::SentencePieceVocab;
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
 use ndarray::Array3;
@@ -305,6 +305,13 @@ impl ParakeetUnified {
         self.process_ready_chunks(false)
     }
 
+    /// Drain any buffered audio that has not yet formed a full chunk.
+    ///
+    /// # Known limitation (M22)
+    /// On flush the final chunk may have fewer right-context samples than the
+    /// configured `right_context_secs`. The missing tail is zero-padded rather
+    /// than fed real audio, so the very last chunk sees slightly less future
+    /// context than steady-state chunks. This is a standard streaming tradeoff.
     pub fn flush(&mut self) -> Result<String> {
         self.process_ready_chunks(true)
     }
@@ -474,12 +481,9 @@ impl ParakeetUnified {
                     &self.state_2,
                 )?;
 
-                let token_id = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(idx, _)| idx)
-                    .unwrap_or(self.blank_id);
+                let token_id = crate::vocab::argmax(
+                    logits.as_slice().expect("decoder logits are contiguous"),
+                );
 
                 if token_id == self.blank_id {
                     break;
@@ -571,6 +575,25 @@ impl Transcriber for ParakeetUnified {
         mode: Option<TimestampMode>,
     ) -> Result<TranscriptionResult> {
         self.transcribe_offline(audio, sample_rate, channels, mode)
+    }
+}
+
+impl crate::streaming::StreamingTranscriber for ParakeetUnified {
+    type Output = String;
+
+    /// Delegates to the inherent [`ParakeetUnified::transcribe_chunk`].
+    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<String> {
+        ParakeetUnified::transcribe_chunk(self, audio)
+    }
+
+    /// Delegates to the inherent [`ParakeetUnified::reset`].
+    fn reset(&mut self) {
+        ParakeetUnified::reset(self)
+    }
+
+    /// Delegates to the inherent [`ParakeetUnified::flush`].
+    fn flush(&mut self) -> Result<String> {
+        ParakeetUnified::flush(self)
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
-use ndarray::{Array1, Array2, Array3, Array4};
+use crate::execution::ExecutionConfig;
+use ndarray::{Array1, Array3, Array4};
 use ort::session::{Session, SessionInputValue};
 use ort::value::ValueType;
 use std::borrow::Cow;
@@ -85,13 +85,34 @@ impl NemotronModel {
             )));
         }
 
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder_joint = crate::onnx::build_session(&exec_config, &decoder_path)?;
 
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_path)?;
+        // Fail fast with a structured error if the export does not expose the
+        // I/O names the encoder/decoder run paths rely on (G-C). `prompt_index`
+        // is intentionally excluded: it is optional (English vs multilingual).
+        crate::error::validate_input_names(
+            &encoder,
+            "nemotron encoder",
+            &[
+                "processed_signal",
+                "processed_signal_length",
+                "cache_last_channel",
+                "cache_last_time",
+                "cache_last_channel_len",
+            ],
+        )?;
+        crate::error::validate_input_names(
+            &decoder_joint,
+            "nemotron decoder_joint",
+            &[
+                "encoder_outputs",
+                "targets",
+                "target_length",
+                "input_states_1",
+                "input_states_2",
+            ],
+        )?;
 
         let mut config = NemotronModelConfig {
             num_encoder_layers: 24,
@@ -126,6 +147,32 @@ impl NemotronModel {
             }
         }
 
+        Ok(Self {
+            encoder,
+            decoder_joint,
+            config,
+            has_prompt,
+        })
+    }
+
+    /// Test-only constructor that builds both sessions from a tiny in-memory
+    /// identity ONNX graph, so state-management tests (e.g. `Nemotron::reset`)
+    /// can run with NO 2 GB model download. The sessions are never executed by
+    /// those tests; only the surrounding Rust state is exercised.
+    #[cfg(test)]
+    pub(crate) fn new_in_memory_for_test(
+        config: NemotronModelConfig,
+        has_prompt: bool,
+    ) -> Result<Self> {
+        // Minimal `Identity` ONNX (ir_version 9, opset 13), emitted by the
+        // onnx Python helper. Two independent sessions are built from it.
+        const IDENTITY_ONNX: &[u8] = &[
+            8, 9, 58, 55, 10, 16, 10, 1, 120, 18, 1, 121, 34, 8, 73, 100, 101, 110, 116, 105,
+            116, 121, 18, 1, 103, 90, 15, 10, 1, 120, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 1,
+            98, 15, 10, 1, 121, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 1, 66, 4, 10, 0, 16, 13,
+        ];
+        let encoder = Session::builder()?.commit_from_memory(IDENTITY_ONNX)?;
+        let decoder_joint = Session::builder()?.commit_from_memory(IDENTITY_ONNX)?;
         Ok(Self {
             encoder,
             decoder_joint,
@@ -236,53 +283,12 @@ impl NemotronModel {
         state_1: &Array3<f32>, // [2, 1, 640]
         state_2: &Array3<f32>, // [2, 1, 640]
     ) -> Result<(Array1<f32>, Array3<f32>, Array3<f32>)> {
-        let targets = Array2::from_shape_vec((1, 1), vec![target_token])
-            .map_err(|e| Error::Model(format!("Failed to create targets: {e}")))?;
-        let target_len = Array1::from_vec(vec![1i32]);
-
-        let outputs = self.decoder_joint.run(ort::inputs![
-            "encoder_outputs" => ort::value::Value::from_array(encoder_frame.clone())?,
-            "targets" => ort::value::Value::from_array(targets)?,
-            "target_length" => ort::value::Value::from_array(target_len)?,
-            "input_states_1" => ort::value::Value::from_array(state_1.clone())?,
-            "input_states_2" => ort::value::Value::from_array(state_2.clone())?
-        ])?;
-
-        // logits for others I think you can understand by looking at the error msgs right?
-        let (_l_shape, l_data) = outputs["outputs"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
-
-        let logits = Array1::from_vec(l_data.to_vec());
-
-        let (h_shape, h_data) = outputs["output_states_1"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_1: {e}")))?;
-
-        let (c_shape, c_data) = outputs["output_states_2"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_2: {e}")))?;
-
-        let new_state_1 = Array3::from_shape_vec(
-            (
-                h_shape[0] as usize,
-                h_shape[1] as usize,
-                h_shape[2] as usize,
-            ),
-            h_data.to_vec(),
+        crate::onnx::run_rnnt_decoder_step(
+            &mut self.decoder_joint,
+            encoder_frame,
+            target_token,
+            state_1,
+            state_2,
         )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_1: {e}")))?;
-
-        let new_state_2 = Array3::from_shape_vec(
-            (
-                c_shape[0] as usize,
-                c_shape[1] as usize,
-                c_shape[2] as usize,
-            ),
-            c_data.to_vec(),
-        )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
-
-        Ok((logits, new_state_1, new_state_2))
     }
 }

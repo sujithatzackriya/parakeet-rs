@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::{Array1, Array2, Array3};
 use ort::session::Session;
 use std::path::{Path, PathBuf};
@@ -41,13 +41,8 @@ impl ParakeetUnifiedModel {
         let encoder_path = Self::find_encoder(model_dir)?;
         let decoder_joint_path = Self::find_decoder_joint(model_dir)?;
 
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_joint_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder_joint = crate::onnx::build_session(&exec_config, &decoder_joint_path)?;
 
         Ok(Self {
             encoder,
@@ -57,37 +52,28 @@ impl ParakeetUnifiedModel {
     }
 
     fn find_encoder(dir: &Path) -> Result<PathBuf> {
-        let candidates = ["encoder.onnx", "encoder.int8.onnx", "encoder-model.onnx"];
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-
-        Err(Error::Config(format!(
-            "No unified encoder model found in {}",
-            dir.display()
-        )))
+        use crate::onnx::{Precision, Quantization};
+        let candidates = [
+            ("encoder.onnx", Precision::Fp32),
+            ("encoder.int8.onnx", Precision::Int8),
+            ("encoder-model.onnx", Precision::Fp32),
+        ];
+        crate::onnx::resolve_onnx_file(dir, "unified encoder", Quantization::Auto, &candidates)
     }
 
     fn find_decoder_joint(dir: &Path) -> Result<PathBuf> {
+        use crate::onnx::{Precision, Quantization};
         let candidates = [
-            "decoder_joint.onnx",
-            "decoder_joint.int8.onnx",
-            "decoder_joint-model.onnx",
+            ("decoder_joint.onnx", Precision::Fp32),
+            ("decoder_joint.int8.onnx", Precision::Int8),
+            ("decoder_joint-model.onnx", Precision::Fp32),
         ];
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-
-        Err(Error::Config(format!(
-            "No unified decoder_joint model found in {}",
-            dir.display()
-        )))
+        crate::onnx::resolve_onnx_file(
+            dir,
+            "unified decoder_joint",
+            Quantization::Auto,
+            &candidates,
+        )
     }
 
     pub fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
@@ -138,50 +124,12 @@ impl ParakeetUnifiedModel {
         state_1: &Array3<f32>,
         state_2: &Array3<f32>,
     ) -> Result<(Array1<f32>, Array3<f32>, Array3<f32>)> {
-        let targets = Array2::from_elem((1, 1), target_token);
-        let target_length = Array1::from_elem(1, 1i32);
-
-        let outputs = self.decoder_joint.run(ort::inputs![
-            "encoder_outputs" => ort::value::Value::from_array(encoder_frame.clone())?,
-            "targets" => ort::value::Value::from_array(targets)?,
-            "target_length" => ort::value::Value::from_array(target_length)?,
-            "input_states_1" => ort::value::Value::from_array(state_1.clone())?,
-            "input_states_2" => ort::value::Value::from_array(state_2.clone())?
-        ])?;
-
-        let (_, logits_data) = outputs["outputs"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
-
-        let logits = Array1::from_vec(logits_data.to_vec());
-
-        let (h_shape, h_data) = outputs["output_states_1"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_1: {e}")))?;
-        let (c_shape, c_data) = outputs["output_states_2"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| Error::Model(format!("Failed to extract state_2: {e}")))?;
-
-        let new_state_1 = Array3::from_shape_vec(
-            (
-                h_shape[0] as usize,
-                h_shape[1] as usize,
-                h_shape[2] as usize,
-            ),
-            h_data.to_vec(),
+        crate::onnx::run_rnnt_decoder_step(
+            &mut self.decoder_joint,
+            encoder_frame,
+            target_token,
+            state_1,
+            state_2,
         )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_1: {e}")))?;
-
-        let new_state_2 = Array3::from_shape_vec(
-            (
-                c_shape[0] as usize,
-                c_shape[1] as usize,
-                c_shape[2] as usize,
-            ),
-            c_data.to_vec(),
-        )
-        .map_err(|e| Error::Model(format!("Failed to reshape state_2: {e}")))?;
-
-        Ok((logits, new_state_1, new_state_2))
     }
 }

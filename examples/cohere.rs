@@ -1,5 +1,5 @@
 /*
-Cohere Transcribe ASR — offline multilingual transcription.
+Cohere Transcribe ASR - offline multilingual transcription.
 
 2B parameter encoder-decoder model supporting 14 languages with inverse text norm.
 

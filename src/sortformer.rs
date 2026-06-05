@@ -20,7 +20,7 @@
 //! Note, my stft code is adapted from: https://librosa.org/doc/main/generated/librosa.stft.html
 
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::{s, Array1, Array2, Array3, Axis};
 use ort::session::Session;
 use realfft::RealFftPlanner;
@@ -216,14 +216,12 @@ impl Sortformer {
     /// Create with custom config
     pub fn with_config<P: AsRef<Path>>(
         model_path: P,
-        execution_config: Option<ModelConfig>,
+        exec_config: Option<ExecutionConfig>,
         config: DiarizationConfig,
     ) -> Result<Self> {
-        let config_to_use = execution_config.unwrap_or_default();
+        let config_to_use = exec_config.unwrap_or_default();
 
-        let mut builder = config_to_use
-            .apply_to_session_builder(Session::builder()?)?;
-        let session = builder.commit_from_file(model_path.as_ref())?;
+        let session = crate::onnx::build_session(&config_to_use, model_path.as_ref())?;
 
         // Read streaming constants from ONNX metadata (fallback to defaults)
         let (chunk_len, fifo_len, spkcache_len, right_context) =
@@ -418,7 +416,7 @@ impl Sortformer {
     /// segments with **absolute** timestamps (accumulated across calls).
     ///
     /// Each successful inference produces `chunk_len * 80ms` worth of predictions
-    /// from exactly one `streaming_update` call — no redundant re-chunking.
+    /// from exactly one `streaming_update` call - no redundant re-chunking.
     ///
     /// # Arguments
     /// * `audio_16k_mono` - Audio samples at 16kHz mono (any length)

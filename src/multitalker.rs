@@ -13,23 +13,22 @@
 
 use crate::decoder::{TimedToken, TranscriptionResult};
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
-use crate::nemotron::SentencePieceVocab;
+use crate::vocab::SentencePieceVocab;
 use crate::sortformer::{Sortformer, NUM_SPEAKERS};
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
 use ndarray::{s, Array2, Array3};
+use realfft::RealToComplex;
 use std::path::Path;
+use std::sync::Arc;
 
-// Reuse the same audio constants as Nemotron (same encoder architecture)
-const SAMPLE_RATE: usize = 16000;
-const N_FFT: usize = 512;
-const WIN_LENGTH: usize = 400;
-const HOP_LENGTH: usize = 160;
-const N_MELS: usize = 128;
-const PREEMPH: f32 = 0.97;
-const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+// Same NeMo front-end geometry as Nemotron (same encoder architecture);
+// single-sourced in crate::audio::constants.
+use crate::audio::constants::{
+    HOP_LENGTH, N_FFT, N_MELS, SAMPLE_RATE, WIN_LENGTH,
+};
 
 // Encoder arch (same as Nemotron 0.6B)
 const NUM_ENCODER_LAYERS: usize = 24;
@@ -52,14 +51,6 @@ const SECONDS_PER_ENCODED_FRAME: f32 = 0.08;
 /// Activity threshold: a speaker is considered active if any frame in the
 /// chunk exceeds this probability.
 const SPEAKER_ACTIVITY_THRESHOLD: f32 = 0.3;
-
-/// Word-level timestamp for a single word in a speaker's transcript.
-#[derive(Debug, Clone)]
-pub struct WordTimestamp {
-    pub word: String,
-    pub start_secs: f32,
-    pub end_secs: f32,
-}
 
 /// Per-speaker state for the multi-instance architecture.
 struct SpeakerInstance {
@@ -95,7 +86,7 @@ impl SpeakerInstance {
 pub struct SpeakerTranscript {
     pub speaker_id: usize,
     pub text: String,
-    pub words: Vec<WordTimestamp>,
+    pub words: Vec<TimedToken>,
 }
 
 /// Streaming latency mode controlling the encoder chunk size.
@@ -203,6 +194,9 @@ pub struct MultitalkerASR {
     speakers: Vec<SpeakerInstance>,
     config: MultitalkerConfig,
     mel_basis: Array2<f32>,
+    /// FFT plan built once at load and reused across every mel computation
+    /// (deterministic from `N_FFT`); avoids rebuilding the planner per chunk.
+    fft_plan: Arc<dyn RealToComplex<f32>>,
     audio_buffer: Vec<f32>,
     audio_processed: usize,
     chunk_idx: usize,
@@ -233,6 +227,7 @@ impl MultitalkerASR {
         )?;
 
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
+        let fft_plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
 
         Ok(Self {
             model,
@@ -241,6 +236,7 @@ impl MultitalkerASR {
             speakers: Vec::new(),
             config: MultitalkerConfig::default(),
             mel_basis,
+            fft_plan,
             audio_buffer: Vec::new(),
             audio_processed: 0,
             chunk_idx: 0,
@@ -322,6 +318,13 @@ impl MultitalkerASR {
     ///
     /// Returns per-speaker text deltas for this chunk. Speakers are created
     /// automatically when first detected.
+    ///
+    /// # Known limitation (M31)
+    /// The ASR chunk (~1.12s in Normal mode) is smaller than Sortformer's
+    /// internal stride (~10s), so the two run at different rates. Sortformer
+    /// pads the short input internally and the resulting speaker masks are
+    /// mapped onto the encoder time axis by nearest-neighbour resampling, which
+    /// can blur speaker boundaries near chunk edges.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<SpeakerTranscript>> {
         self.audio_buffer.extend_from_slice(audio_chunk);
 
@@ -617,14 +620,9 @@ impl MultitalkerASR {
                     &self.speakers[spk_idx].state_2,
                 )?;
 
-                let mut max_idx = 0;
-                let mut max_val = f32::NEG_INFINITY;
-                for (i, &v) in logits.iter().enumerate() {
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = i;
-                    }
-                }
+                let max_idx = crate::vocab::argmax(
+                    logits.as_slice().expect("decoder logits are contiguous"),
+                );
 
                 if max_idx == BLANK_ID {
                     break;
@@ -641,7 +639,7 @@ impl MultitalkerASR {
     }
 
     /// Convert (token_id, absolute_frame) pairs into word-level timestamps.
-    fn tokens_to_words(&self, tokens: &[(usize, usize)]) -> Vec<WordTimestamp> {
+    fn tokens_to_words(&self, tokens: &[(usize, usize)]) -> Vec<TimedToken> {
         let timed: Vec<TimedToken> = tokens
             .iter()
             .filter(|(id, _)| *id < VOCAB_SIZE)
@@ -653,27 +651,32 @@ impl MultitalkerASR {
             .collect();
 
         timestamps::group_by_words(&timed)
-            .into_iter()
-            .map(|t| WordTimestamp {
-                word: t.text,
-                start_secs: t.start,
-                end_secs: t.end,
-            })
-            .collect()
     }
 
     /// Compute mel spectrogram using shared audio utilities.
     fn compute_mel_spectrogram(&self, audio: &[f32]) -> Result<Array2<f32>> {
-        if audio.is_empty() {
-            return Ok(Array2::zeros((N_MELS, 0)));
-        }
-
-        let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&preemph, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
-        let mel = self.mel_basis.dot(&spec);
-
-        Ok(mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln()))
+        crate::audio::log_mel_spectrogram(audio, &self.mel_basis, &self.fft_plan)
     }
+}
+
+impl crate::streaming::StreamingTranscriber for MultitalkerASR {
+    /// Per-chunk output is one transcript delta per active speaker, not a flat
+    /// `String` like the single-speaker variants.
+    type Output = Vec<SpeakerTranscript>;
+
+    /// Delegates to the inherent [`MultitalkerASR::transcribe_chunk`].
+    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<Vec<SpeakerTranscript>> {
+        MultitalkerASR::transcribe_chunk(self, audio)
+    }
+
+    /// Delegates to the inherent [`MultitalkerASR::reset`].
+    fn reset(&mut self) {
+        MultitalkerASR::reset(self)
+    }
+
+    // No `flush`: the multitalker path carries no sub-chunk trailing buffer to
+    // drain (each chunk runs Sortformer + ASR end to end), so the trait default
+    // (`Ok(Vec::new())`) is correct.
 }
 
 /// Implement the Transcriber trait for single-speaker fallback.

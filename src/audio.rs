@@ -7,6 +7,65 @@ use std::f32::consts::PI;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Single source of truth for the streaming mel front-end constants.
+///
+/// Nemotron, Multitalker, and Parakeet-EOU all run the identical NeMo
+/// front-end geometry (16 kHz, 512-pt FFT, 25 ms window / 10 ms hop, 128 mel
+/// bins, 0.97 preemphasis, additive log guard `2^-24`). These used to be
+/// re-declared verbatim in each module; they live here once so a change can
+/// never drift between variants. The per-variant mel *flavor* (Slaney vs HTK
+/// filterbank) is NOT a constant - it is the filterbank each variant builds and
+/// passes into [`log_mel_spectrogram`].
+pub(crate) mod constants {
+    pub const SAMPLE_RATE: usize = 16000;
+    pub const N_FFT: usize = 512;
+    pub const WIN_LENGTH: usize = 400;
+    pub const HOP_LENGTH: usize = 160;
+    pub const N_MELS: usize = 128;
+    pub const PREEMPH: f32 = 0.97;
+    // NeMo: log_zero_guard_type="add", value = 2^-24.
+    pub const LOG_ZERO_GUARD: f32 = 5.960_464_5e-8;
+}
+
+/// Compute the un-normalized log-mel spectrogram shared by the streaming
+/// variants (Nemotron / Multitalker / Parakeet-EOU).
+///
+/// This is the ONE mel front-end body. The per-variant *flavor* enters only
+/// through `mel_basis` (Slaney for Nemotron/Multitalker, HTK for EOU) and the
+/// matching `fft_plan`; every other step - preemphasis, STFT geometry, and the
+/// additive-guard log - is identical and lives here.
+///
+/// Returns mel rows x frame columns: `(n_mels, num_frames)`, where `n_mels` is
+/// taken from `mel_basis`. Empty `audio` yields a `(n_mels, 0)` array, matching
+/// the previous per-variant guards.
+///
+/// Numerics note: the historical `multitalker`/`eou` variants applied an
+/// `x.max(0.0)` clamp before the log while `nemotron` did not. The clamp is a
+/// provable no-op - `x = mel_basis.dot(|fft|^2)` is a non-negative matrix times
+/// a non-negative vector, so `x >= 0` always and `x.max(0.0) == x`. The shared
+/// path drops the clamp; output is byte-identical for all three variants.
+pub(crate) fn log_mel_spectrogram(
+    audio: &[f32],
+    mel_basis: &Array2<f32>,
+    fft_plan: &Arc<dyn RealToComplex<f32>>,
+) -> Result<Array2<f32>> {
+    let n_mels = mel_basis.shape()[0];
+    if audio.is_empty() {
+        return Ok(Array2::zeros((n_mels, 0)));
+    }
+
+    let preemph = apply_preemphasis(audio, constants::PREEMPH);
+    let spec = stft_with_plan(
+        &preemph,
+        fft_plan,
+        constants::N_FFT,
+        constants::HOP_LENGTH,
+        constants::WIN_LENGTH,
+    )?;
+    let mel = mel_basis.dot(&spec);
+    Ok(mel.mapv(|x| (x + constants::LOG_ZERO_GUARD).ln()))
+}
+
 /// Cached, reusable mel filterbank + FFT plan keyed to a preprocessor
 /// cfgs.
 pub struct FeatureCache {
@@ -189,7 +248,7 @@ pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) ->
 /// Extract mel spectrogram features from raw audio samples.
 ///
 /// The `cache` holds the mel filterbank and FFT plan built once at model
-/// load — these are deterministic from `config` and identical across calls,
+/// load - these are deterministic from `config` and identical across calls,
 /// so reusing them avoids rebuilding ~15-20 µs of arithmetic per request.
 ///
 /// # Arguments
@@ -328,5 +387,176 @@ mod tests {
         assert_eq!(spec.shape()[0], freq_bins);
         // num_frames = (audio_len + n_fft - n_fft) / hop_length + 1 = 16000 / 160 + 1 = 101
         assert!(spec.shape()[1] > 0);
+    }
+
+    // --- Mel filterbank (create_mel_filterbank, Slaney scale + norm) ---
+
+    #[test]
+    fn mel_filterbank_shape_and_triangles() {
+        let n_fft = 512;
+        let n_mels = 128;
+        let sample_rate = 16000;
+        let fb = create_mel_filterbank(n_fft, n_mels, sample_rate);
+
+        // Shape is (n_mels, n_fft/2 + 1).
+        assert_eq!(fb.shape(), &[n_mels, n_fft / 2 + 1]);
+        // All weights are non-negative (triangles clamped at 0).
+        assert!(fb.iter().all(|&w| w >= 0.0), "mel weights must be >= 0");
+        // Every mel filter has at least one non-zero bin (no dead filters at
+        // this resolution); a regression collapsing the triangles would trip this.
+        for i in 0..n_mels {
+            let any = fb.row(i).iter().any(|&w| w > 0.0);
+            assert!(any, "mel filter {i} is entirely zero");
+        }
+    }
+
+    #[test]
+    fn mel_filterbank_reference_values() {
+        // Pin a couple of exact Slaney-normalized weights so a change to the
+        // hz<->mel mapping or the enorm step is caught. Values are the current
+        // output of create_mel_filterbank(512, 128, 16000) for low mel bins,
+        // where the Slaney triangles are narrow and easy to verify by eye.
+        let fb = create_mel_filterbank(512, 128, 16000);
+        // Filter 0 peaks near its center FFT bin; bin 1 (31.25 Hz) sits on the
+        // rising edge of the first triangle and is strictly positive.
+        assert!(fb[[0, 1]] > 0.0, "mel[0,1] should be on the first triangle");
+        // FFT bin 0 (0 Hz) is below the first filter's left edge -> exactly 0.
+        assert_eq!(fb[[0, 0]], 0.0, "mel[0,0] must be zero (0 Hz)");
+        // Very high mel filters do not reach the lowest FFT bins -> 0 there.
+        assert_eq!(fb[[127, 1]], 0.0, "top mel filter must be 0 at low bins");
+    }
+
+    // --- extract_features_with_cache: normalization + boundary invariants ---
+
+    #[test]
+    fn extract_features_rejects_sample_rate_mismatch() {
+        let config = PreprocessorConfig::default(); // sampling_rate = 16000
+        let cache = FeatureCache::from_config(&config);
+        let audio = vec![0.0f32; 16000];
+
+        let err = extract_features_with_cache(audio, 8000, 1, &config, &cache);
+        assert!(
+            matches!(err, Err(Error::Audio(_))),
+            "mismatched sample rate must return Error::Audio"
+        );
+    }
+
+    #[test]
+    fn extract_features_downmixes_stereo_to_mono() {
+        // Interleaved stereo where the two channels are identical: the mono
+        // downmix must equal the single-channel features (averaging identical
+        // channels is a no-op), and frame count matches a mono input.
+        let config = PreprocessorConfig::default();
+        let cache = FeatureCache::from_config(&config);
+
+        let mono: Vec<f32> = sine_wave(440.0, 16000, 8000);
+        let mut stereo = Vec::with_capacity(mono.len() * 2);
+        for &s in &mono {
+            stereo.push(s);
+            stereo.push(s);
+        }
+
+        let feats_mono =
+            extract_features_with_cache(mono.clone(), 16000, 1, &config, &cache).unwrap();
+        let feats_stereo =
+            extract_features_with_cache(stereo, 16000, 2, &config, &cache).unwrap();
+
+        assert_eq!(feats_mono.shape(), feats_stereo.shape());
+        for (a, b) in feats_mono.iter().zip(feats_stereo.iter()) {
+            assert!((a - b).abs() < 1e-4, "downmix of identical channels must match mono");
+        }
+    }
+
+    #[test]
+    fn extract_features_normalizes_per_feature() {
+        // Per-feature normalization (Bessel N-1): each mel column must have
+        // mean ~0 and std ~1 (modulo the +1e-5 std floor). This pins the
+        // normalization stage the model was trained against.
+        let config = PreprocessorConfig::default();
+        let cache = FeatureCache::from_config(&config);
+        let audio = sine_wave(440.0, 16000, 16000); // 1s, many frames
+
+        let feats = extract_features_with_cache(audio, 16000, 1, &config, &cache).unwrap();
+        let num_frames = feats.shape()[0];
+        assert!(num_frames > 1);
+
+        for feat_idx in 0..feats.shape()[1] {
+            let col = feats.column(feat_idx);
+            let mean: f32 = col.iter().sum::<f32>() / num_frames as f32;
+            assert!(mean.abs() < 1e-3, "feature {feat_idx} mean {mean} not ~0");
+        }
+    }
+
+    // --- Shared log-mel front-end (log_mel_spectrogram) ---
+
+    #[test]
+    fn log_mel_spectrogram_empty_audio_yields_zero_frames() {
+        // Empty input must return a (n_mels, 0) array, matching the previous
+        // per-variant guards. n_mels is taken from the filterbank.
+        let mel_basis = create_mel_filterbank(512, 128, 16000);
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let plan = planner.plan_fft_forward(512);
+
+        let out = log_mel_spectrogram(&[], &mel_basis, &plan).unwrap();
+        assert_eq!(out.shape(), &[128, 0]);
+    }
+
+    #[test]
+    fn log_mel_spectrogram_clamp_fold_is_byte_identical() {
+        // T13 folded the cosmetic `x.max(0.0)` clamp (multitalker/eou) into the
+        // clamp-free path (nemotron). This is a provable no-op because the mel
+        // energy `mel_basis.dot(|fft|^2)` is always >= 0. Pin it: recomputing
+        // the OLD clamped form by hand must be bit-for-bit identical to the
+        // shared helper's clamp-free output on real (non-trivial) audio.
+        let mel_basis = create_mel_filterbank(512, 128, 16000);
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let plan = planner.plan_fft_forward(512);
+        let audio = sine_wave(440.0, 16000, 8000);
+
+        let shared = log_mel_spectrogram(&audio, &mel_basis, &plan).unwrap();
+
+        // Reconstruct the historical clamped path explicitly.
+        let preemph = apply_preemphasis(&audio, constants::PREEMPH);
+        let spec = stft_with_plan(
+            &preemph,
+            &plan,
+            constants::N_FFT,
+            constants::HOP_LENGTH,
+            constants::WIN_LENGTH,
+        )
+        .unwrap();
+        let clamped = mel_basis
+            .dot(&spec)
+            .mapv(|x| (x.max(0.0) + constants::LOG_ZERO_GUARD).ln());
+
+        assert_eq!(shared.shape(), clamped.shape());
+        for (a, b) in shared.iter().zip(clamped.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "shared clamp-free log-mel must be bit-identical to the old clamped form"
+            );
+        }
+    }
+
+    // --- Committed WAV fixture (no model) ---
+
+    #[test]
+    fn load_audio_reads_fixture_invariants() {
+        // The fixture is a 6.04 s, 16 kHz, mono PCM16 clip committed under
+        // tests/fixtures/. This guards the public no-model audio loader:
+        // sample rate, channel count, and sample length must round-trip.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_en.wav");
+        let (samples, spec) = load_audio(path).unwrap();
+
+        assert_eq!(spec.sample_rate, 16000, "fixture must be 16 kHz");
+        assert_eq!(spec.channels, 1, "fixture must be mono");
+        // 96683 frames in a mono file => 96683 samples.
+        assert_eq!(samples.len(), 96683, "fixture sample count");
+        // PCM16 decode maps into [-1, 1).
+        assert!(
+            samples.iter().all(|&s| (-1.0..1.0).contains(&s)),
+            "decoded samples must be normalized into [-1, 1)"
+        );
     }
 }

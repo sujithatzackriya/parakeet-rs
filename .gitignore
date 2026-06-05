@@ -12,3 +12,6 @@ DS_Store
 *.onnx.data
 *.onnx_data_*
 *.model
+
+# Committed test fixtures (override *.wav ignore above)
+!tests/fixtures/*.wav

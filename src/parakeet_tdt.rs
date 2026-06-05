@@ -3,7 +3,7 @@ use crate::config::PreprocessorConfig;
 use crate::decoder::TranscriptionResult;
 use crate::decoder_tdt::ParakeetTDTDecoder;
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_tdt::ParakeetTDTModel;
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
@@ -24,10 +24,10 @@ impl ParakeetTDT {
     ///
     /// # Arguments
     /// * `path` - Directory containing encoder-model.onnx, decoder_joint-model.onnx, and vocab.txt
-    /// * `config` - Optional execution configuration (defaults to CPU if None)
+    /// * `exec_config` - Optional execution configuration (defaults to CPU if None)
     pub fn from_pretrained<P: AsRef<Path>>(
         path: P,
-        config: Option<ExecutionConfig>,
+        exec_config: Option<ExecutionConfig>,
     ) -> Result<Self> {
         let path = path.as_ref();
 
@@ -61,7 +61,7 @@ impl ParakeetTDT {
             win_length: 400,
         };
 
-        let exec_config = config.unwrap_or_default();
+        let exec_config = exec_config.unwrap_or_default();
 
         // Load vocab first to get the actual vocabulary size
         let vocab = Vocabulary::from_file(&vocab_path)?;

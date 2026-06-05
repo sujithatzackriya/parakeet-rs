@@ -27,7 +27,7 @@
 use crate::audio::{extract_features_with_cache, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model_cohere::{CohereEncoderOutput, CohereModel, CoherePastKv, N_MELS};
 use ndarray::{Array2, Axis};
 use std::collections::HashMap;
@@ -54,7 +54,9 @@ const TOKEN_EMO_UNDEFINED: &str = "<|emo:undefined|>";
 const TOKEN_ENDOFTEXT: &str = "<|endoftext|>";
 const TOKEN_PNC: &str = "<|pnc|>";
 const TOKEN_NOPNC: &str = "<|nopnc|>";
+const TOKEN_TIMESTAMP: &str = "<|timestamp|>";
 const TOKEN_NOTIMESTAMP: &str = "<|notimestamp|>";
+const TOKEN_DIARIZE: &str = "<|diarize|>";
 const TOKEN_NODIARIZE: &str = "<|nodiarize|>";
 const TOKEN_ITN: &str = "<|itn|>";
 const TOKEN_NOITN: &str = "<|noitn|>";
@@ -70,7 +72,7 @@ const MAX_DECODE_TOKENS_LIMIT: usize = 1024;
 const DEFAULT_MAX_DECODE_TOKENS: usize = 512;
 
 /// Training chunk length recorded in `preprocessor_config.json`
-/// (`max_audio_clip_s`). This is *not* a runtime limit — the official model
+/// (`max_audio_clip_s`). This is *not* a runtime limit - the official model
 /// card lists long-form transcription as a supported feature and audio well
 /// past this length transcribes fine. Exposed via
 /// [`CohereASR::training_chunk_secs`] only as informational metadata :-)
@@ -85,6 +87,45 @@ const SUPPORTED_LANGUAGES: &[&str] = &[
 ];
 
 
+/// Optional generation toggles for the Cohere decoder prompt.
+///
+/// The model emits timestamp and speaker-diarization markers as prompt
+/// choices in the same slot family as `pnc`/`itn`. Both default to `false`,
+/// which selects the `<|notimestamp|>`/`<|nodiarize|>` tokens and reproduces
+/// the engine's original behaviour byte-for-byte.
+///
+/// ```
+/// # #[cfg(feature = "cohere")] {
+/// use parakeet_rs::CohereOptions;
+/// let opts = CohereOptions::default().with_timestamps(true);
+/// assert!(opts.timestamps);
+/// assert!(!opts.diarize);
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CohereOptions {
+    /// Emit `<|timestamp|>` instead of `<|notimestamp|>` so the model
+    /// produces timestamp markers in its output. Defaults to `false`.
+    pub timestamps: bool,
+    /// Emit `<|diarize|>` instead of `<|nodiarize|>` so the model produces
+    /// speaker-diarization markers in its output. Defaults to `false`.
+    pub diarize: bool,
+}
+
+impl CohereOptions {
+    /// Set whether the model emits timestamp markers.
+    pub fn with_timestamps(mut self, timestamps: bool) -> Self {
+        self.timestamps = timestamps;
+        self
+    }
+
+    /// Set whether the model emits speaker-diarization markers.
+    pub fn with_diarize(mut self, diarize: bool) -> Self {
+        self.diarize = diarize;
+        self
+    }
+}
+
 struct DecoderTokens {
     decoder_start: i64,
     startofcontext: i64,
@@ -93,13 +134,56 @@ struct DecoderTokens {
     eos: i64,
     pnc: i64,
     nopnc: i64,
+    timestamp: i64,
     notimestamp: i64,
+    diarize: i64,
     nodiarize: i64,
     itn: i64,
     noitn: i64,
 }
 
 impl DecoderTokens {
+    /// Build the canonical Cohere decoder prompt for one transcription.
+    ///
+    /// Mirrors what `CohereAsrProcessor` in transformers produces. The source
+    /// and target language tokens are both `lang_token` since this is pure
+    /// transcription (no translation). The `pnc`/`itn`/timestamp/diarize slots
+    /// select their positive or negative variant from `punctuation`, `itn`,
+    /// and `options`. With `CohereOptions::default()` this yields the original
+    /// `<|notimestamp|><|nodiarize|>` sequence.
+    fn build_prompt(
+        &self,
+        lang_token: i64,
+        punctuation: bool,
+        itn: bool,
+        options: CohereOptions,
+    ) -> Vec<i64> {
+        let pnc_token = if punctuation { self.pnc } else { self.nopnc };
+        let itn_token = if itn { self.itn } else { self.noitn };
+        let timestamp_token = if options.timestamps {
+            self.timestamp
+        } else {
+            self.notimestamp
+        };
+        let diarize_token = if options.diarize {
+            self.diarize
+        } else {
+            self.nodiarize
+        };
+        vec![
+            self.decoder_start,
+            self.startofcontext,
+            self.sot,
+            self.emo_undefined,
+            lang_token,
+            lang_token,
+            pnc_token,
+            itn_token,
+            timestamp_token,
+            diarize_token,
+        ]
+    }
+
     fn resolve(tokenizer: &Tokenizer) -> Result<Self> {
         Ok(Self {
             decoder_start: require_token(tokenizer, TOKEN_WORD_BOUNDARY)?,
@@ -109,7 +193,9 @@ impl DecoderTokens {
             eos: require_token(tokenizer, TOKEN_ENDOFTEXT)?,
             pnc: require_token(tokenizer, TOKEN_PNC)?,
             nopnc: require_token(tokenizer, TOKEN_NOPNC)?,
+            timestamp: require_token(tokenizer, TOKEN_TIMESTAMP)?,
             notimestamp: require_token(tokenizer, TOKEN_NOTIMESTAMP)?,
+            diarize: require_token(tokenizer, TOKEN_DIARIZE)?,
             nodiarize: require_token(tokenizer, TOKEN_NODIARIZE)?,
             itn: require_token(tokenizer, TOKEN_ITN)?,
             noitn: require_token(tokenizer, TOKEN_NOITN)?,
@@ -141,7 +227,7 @@ fn cohere_preprocessor_config() -> PreprocessorConfig {
 pub struct CohereASR {
     model: CohereModel,
     tokenizer: Tokenizer,
-    /// Mel/STFT parameters (hardcoded — see [`cohere_preprocessor_config`]).
+    /// Mel/STFT parameters (hardcoded - see [`cohere_preprocessor_config`]).
     preprocessor: PreprocessorConfig,
     /// Pre-built mel filterbank + FFT plan ->> reused across every transcribe call.
     feature_cache: FeatureCache,
@@ -214,7 +300,7 @@ impl CohereASR {
     }
 
     /// Training chunk length (in seconds) recorded in the upstream
-    /// `preprocessor_config.json`. Exposed as metadata only — the model
+    /// `preprocessor_config.json`. Exposed as metadata only - the model
     /// card lists long-form transcription as supported and audio longer
     /// than this transcribes fine in practice.
     pub fn training_chunk_secs(&self) -> f32 {
@@ -234,7 +320,11 @@ impl CohereASR {
 
     /// Transcribe raw 16 kHz mono f32 audio samples.
     ///
-    /// `language` is an ISO 639-1 code (e.g. `"en"`, `"fr"`, `"de"`, `"ja"`).
+    /// `language` accepts a [`Language`](crate::Language) or, via
+    /// `impl Into<Language>`, a bare ISO 639-1 code string (e.g. `"en"`, `"fr"`,
+    /// `"de"`, `"ja"`). Cohere uses bare ISO codes, not the locale form Nemotron
+    /// uses (`"en-US"`); pass the ISO code (or [`Language::Other`](crate::Language::Other))
+    /// and it resolves through Cohere's supported-language table unchanged.
     /// `punctuation` controls whether output includes punctuation and
     /// capitalisation. `itn` enables inverse text normalisation
     /// (e.g. "twenty three" -> "23").
@@ -253,18 +343,45 @@ impl CohereASR {
     pub fn transcribe_audio(
         &mut self,
         audio: &[f32],
-        language: &str,
+        language: impl Into<crate::Language>,
         punctuation: bool,
         itn: bool,
+    ) -> Result<String> {
+        self.transcribe_audio_with_options(
+            audio,
+            language,
+            punctuation,
+            itn,
+            CohereOptions::default(),
+        )
+    }
+
+    /// Transcribe with explicit [`CohereOptions`] controlling the model's
+    /// timestamp/diarize prompt toggles.
+    ///
+    /// Behaves exactly like [`Self::transcribe_audio`] but additionally lets
+    /// the caller request `<|timestamp|>` / `<|diarize|>` markers in the
+    /// output. Passing [`CohereOptions::default()`] is byte-for-byte identical
+    /// to [`Self::transcribe_audio`]. See that method for the `language` /
+    /// `punctuation` / `itn` semantics and the long-form audio notes.
+    pub fn transcribe_audio_with_options(
+        &mut self,
+        audio: &[f32],
+        language: impl Into<crate::Language>,
+        punctuation: bool,
+        itn: bool,
+        options: CohereOptions,
     ) -> Result<String> {
         if audio.is_empty() {
             return Ok(String::new());
         }
 
-        let lang_token = self.lang_tokens.get(language).copied().ok_or_else(|| {
+        let language = language.into();
+        let code = language.as_str();
+        let lang_token = self.lang_tokens.get(code).copied().ok_or_else(|| {
             Error::Config(format!(
                 "Unsupported language '{}'. Supported: {:?}",
-                language,
+                code,
                 self.supported_languages()
             ))
         })?;
@@ -293,21 +410,9 @@ impl CohereASR {
         //    CohereAsrProcessor in transformers produces. The source and
         //    target language tokens are both the caller's `language` code
         //    since this is pure transcription (no translation).
-        let t = &self.tokens;
-        let pnc_token = if punctuation { t.pnc } else { t.nopnc };
-        let itn_token = if itn { t.itn } else { t.noitn };
-        let prompt = vec![
-            t.decoder_start,
-            t.startofcontext,
-            t.sot,
-            t.emo_undefined,
-            lang_token,
-            lang_token,
-            pnc_token,
-            itn_token,
-            t.notimestamp,
-            t.nodiarize,
-        ];
+        let prompt = self
+            .tokens
+            .build_prompt(lang_token, punctuation, itn, options);
 
         // 4. Greedy decode loop
         let token_ids = self.decode_greedy(&prompt, &encoder_out)?;
@@ -419,14 +524,11 @@ fn find_ngram_repetition(tokens: &[i64], min_len: usize) -> Option<usize> {
     None
 }
 
-/// Greedy argmax over a slice of f32 logits.
+/// Greedy argmax over a slice of f32 logits, returning the token id as `i64`.
+/// Delegates to the single shared decoder policy (first-wins + finite-guard;
+/// unified by T10/M5).
 fn argmax(logits: &[f32]) -> i64 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as i64)
-        .unwrap_or(0)
+    crate::vocab::argmax(logits) as i64
 }
 
 #[cfg(test)]
@@ -443,6 +545,58 @@ mod tests {
     fn test_supported_languages_count() {
         // Cohere Transcribe officially ships trained weights for 14 languages
         assert_eq!(SUPPORTED_LANGUAGES.len(), 14);
+    }
+
+    // Distinct sentinel ids so a wrong slot is obvious in assertions. No
+    // tokenizer/model needed - we exercise pure prompt construction.
+    fn fake_tokens() -> DecoderTokens {
+        DecoderTokens {
+            decoder_start: 1,
+            startofcontext: 2,
+            sot: 3,
+            emo_undefined: 4,
+            eos: 5,
+            pnc: 6,
+            nopnc: 7,
+            timestamp: 8,
+            notimestamp: 9,
+            diarize: 10,
+            nodiarize: 11,
+            itn: 12,
+            noitn: 13,
+        }
+    }
+
+    #[test]
+    fn test_build_prompt_default_matches_legacy_behavior() {
+        let t = fake_tokens();
+        let lang = 99;
+        // Default options (timestamps off, diarize off) must reproduce the
+        // exact sequence the engine hardcoded before T19, ending in
+        // notimestamp(9), nodiarize(11).
+        let prompt = t.build_prompt(lang, /*punctuation*/ true, /*itn*/ false, CohereOptions::default());
+        assert_eq!(prompt, vec![1, 2, 3, 4, 99, 99, /*pnc*/ 6, /*noitn*/ 13, /*notimestamp*/ 9, /*nodiarize*/ 11]);
+    }
+
+    #[test]
+    fn test_build_prompt_toggles_swap_individual_tokens() {
+        let t = fake_tokens();
+        let lang = 99;
+
+        // timestamps on -> timestamp(8) in slot 8, diarize still off -> nodiarize(11).
+        let ts = t.build_prompt(lang, false, false, CohereOptions::default().with_timestamps(true));
+        assert_eq!(ts[8], t.timestamp);
+        assert_eq!(ts[9], t.nodiarize);
+
+        // diarize on -> diarize(10) in slot 9, timestamp still off -> notimestamp(9).
+        let dz = t.build_prompt(lang, false, false, CohereOptions::default().with_diarize(true));
+        assert_eq!(dz[8], t.notimestamp);
+        assert_eq!(dz[9], t.diarize);
+
+        // both on.
+        let both = t.build_prompt(lang, false, false, CohereOptions { timestamps: true, diarize: true });
+        assert_eq!(both[8], t.timestamp);
+        assert_eq!(both[9], t.diarize);
     }
 
     #[test]

@@ -37,7 +37,7 @@ Nemotron multilingual 3.5 (600M, 40 language-locales, vocab 13087):
   are experimental and not in the model card.
 - Files in the same layout (encoder.onnx + .data, decoder_joint.onnx, tokenizer.model)
 - Expects path: ./nemotron_multi
-- Variant is auto-detected at load time — same `Nemotron::from_pretrained` call.
+- Variant is auto-detected at load time - same `Nemotron::from_pretrained` call.
 
 EOU (120M, 17 layers):
 - Download: https://huggingface.co/altunenes/parakeet-rs/tree/main/realtime_eou_120m-v1-onnx
@@ -116,8 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Streaming: ");
         let mut full_text = String::new();
 
-        for chunk in audio.chunks(chunk_size) {
-            let text = model.transcribe(&chunk.to_vec(), false)?;
+        for chunk_data in audio.chunks(chunk_size) {
+            // transcribe() requires exactly EOU_CHUNK_SAMPLES samples; zero-pad
+            // the trailing partial chunk to the required size.
+            let chunk: Vec<f32> = if chunk_data.len() < chunk_size {
+                let mut p = chunk_data.to_vec();
+                p.resize(chunk_size, 0.0);
+                p
+            } else {
+                chunk_data.to_vec()
+            };
+            let text = model.transcribe_chunk(&chunk)?;
             if !text.is_empty() {
                 print!("{}", text);
                 std::io::stdout().flush()?;
@@ -127,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Flush
         for _ in 0..3 {
-            let text = model.transcribe(&vec![0.0; chunk_size], false)?;
+            let text = model.transcribe_chunk(&vec![0.0; chunk_size])?;
             if !text.is_empty() {
                 print!("{}", text);
                 full_text.push_str(&text);

@@ -2,7 +2,7 @@ use crate::audio::{self, FeatureCache};
 use crate::config::PreprocessorConfig;
 use crate::decoder::{ParakeetDecoder, TranscriptionResult};
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use crate::model::ParakeetModel;
 use crate::timestamps::{process_timestamps, TimestampMode};
 use crate::transcriber::Transcriber;
@@ -21,7 +21,7 @@ impl Parakeet {
     ///
     /// # Arguments
     /// * `path` - Directory containing model files, or path to specific model file
-    /// * `config` - Optional execution configuration (defaults to CPU if None)
+    /// * `exec_config` - Optional execution configuration (defaults to CPU if None)
     ///
     /// # Examples
     /// ```no_run
@@ -39,7 +39,7 @@ impl Parakeet {
     /// and pass an `ExecutionConfig` with the desired execution provider.
     pub fn from_pretrained<P: AsRef<Path>>(
         path: P,
-        config: Option<ExecutionConfig>,
+        exec_config: Option<ExecutionConfig>,
     ) -> Result<Self> {
         let path = path.as_ref();
 
@@ -72,7 +72,7 @@ impl Parakeet {
         }
 
         let preprocessor_config = PreprocessorConfig::default();
-        let exec_config = config.unwrap_or_default();
+        let exec_config = exec_config.unwrap_or_default();
 
         let model = ParakeetModel::from_pretrained_with_config(&model_path, exec_config)?;
         let decoder = ParakeetDecoder::from_pretrained(&tokenizer_path)?;

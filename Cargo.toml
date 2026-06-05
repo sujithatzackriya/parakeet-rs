@@ -1,6 +1,6 @@
 [package]
 name = "parakeet-rs"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2021"
 authors = ["altunenes"]
 description = "Fast ASR & Speaker Diarization with NVIDIA Parakeet via ONNX"
@@ -48,11 +48,19 @@ hound = "3.5"
 eyre = "0.6"
 ndarray = "0.17"
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+thiserror = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 realfft = "3"
 
 [dev-dependencies]
+cpal = "0.15"
+criterion = "0.5"
+
+[[bench]]
+name = "transcribe"
+path = "benches/transcribe.rs"
+harness = false
 
 [features]
 default = ["cpu", "ort-defaults"]

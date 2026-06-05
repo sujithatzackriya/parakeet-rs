@@ -15,15 +15,19 @@
 //!
 //! ## Quick Start
 //!
-//! ```ignore
+//! ```no_run
 //! use parakeet_rs::{Parakeet, Transcriber, TimestampMode};
 //!
-//! // Load the model
-//! let mut parakeet = Parakeet::from_pretrained(".")?;
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Load the model (pass None for the default CPU execution provider)
+//! let mut parakeet = Parakeet::from_pretrained(".", None)?;
 //!
-//! // Transcribe audio samples (see examples/raw.rs for audio loading)
-//! let result = parakeet.transcribe_samples(audio, sample_rate, channels, Some(TimestampMode::Words))?;
+//! // Transcribe 16kHz mono audio samples (see examples/raw.rs for audio loading)
+//! let audio: Vec<f32> = Vec::new();
+//! let result = parakeet.transcribe_samples(audio, 16000, 1, Some(TimestampMode::Words))?;
 //! println!("Transcription: {}", result.text);
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Model Requirements
@@ -49,16 +53,19 @@ mod decoder;
 mod decoder_tdt;
 mod error;
 mod execution;
+mod language;
 mod model;
 mod model_eou;
 mod model_nemotron;
 mod model_tdt;
 mod model_unified;
 mod nemotron;
+mod onnx;
 mod parakeet;
 mod parakeet_eou;
 mod parakeet_tdt;
 mod parakeet_unified;
+mod streaming;
 #[cfg(feature = "sortformer")]
 pub mod sortformer;
 #[cfg(feature = "multitalker")]
@@ -74,26 +81,24 @@ mod transcriber;
 mod vocab;
 
 pub use error::{Error, Result};
-pub use execution::{ExecutionProvider, ModelConfig as ExecutionConfig};
+pub use execution::{ExecutionConfig, ExecutionProvider};
+pub use language::Language;
 pub use parakeet::Parakeet;
 pub use parakeet_tdt::ParakeetTDT;
 pub use timestamps::TimestampMode;
-pub use transcriber::*;
+pub use transcriber::Transcriber;
 
 pub use audio::FeatureCache;
-pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
+pub use config::{ModelConfigJson, PreprocessorConfig};
 
-pub use decoder::{ParakeetDecoder, TimedToken, TranscriptionResult};
-pub use model::ParakeetModel;
-pub use model_eou::ParakeetEOUModel;
-pub use model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};
-pub use model_unified::{ParakeetUnifiedModel, UnifiedModelConfig};
-pub use nemotron::{Nemotron, NemotronHandle, NemotronMode, SentencePieceVocab};
-pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle};
+pub use decoder::{TimedToken, TranscriptionResult};
+pub use nemotron::{Nemotron, NemotronHandle, NemotronMode};
+pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle, EOU_CHUNK_SAMPLES};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
+pub use streaming::StreamingTranscriber;
 
 #[cfg(feature = "multitalker")]
-pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript};
 
 #[cfg(feature = "cohere")]
-pub use cohere::CohereASR;
+pub use cohere::{CohereASR, CohereOptions};

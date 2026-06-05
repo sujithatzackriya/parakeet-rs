@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::execution::ModelConfig as ExecutionConfig;
+use crate::execution::ExecutionConfig;
 use ndarray::{Array1, Array2, Array3, Array4};
 use ort::session::Session;
 use std::path::Path;
@@ -49,15 +49,8 @@ impl ParakeetEOUModel {
             )));
         }
 
-        // Load encoder
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let encoder = builder.commit_from_file(&encoder_path)?;
-
-        // Load decoder
-        let builder = Session::builder()?;
-        let mut builder = exec_config.apply_to_session_builder(builder)?;
-        let decoder_joint = builder.commit_from_file(&decoder_path)?;
+        let encoder = crate::onnx::build_session(&exec_config, &encoder_path)?;
+        let decoder_joint = crate::onnx::build_session(&exec_config, &decoder_path)?;
 
         Ok(Self {
             encoder,
