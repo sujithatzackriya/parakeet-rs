@@ -3,6 +3,7 @@ use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel};
 use crate::vocab::{language_from_tokens, SentencePieceVocab};
 use ndarray::{s, Array2, Array3};
+use realfft::RealToComplex;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -94,6 +95,9 @@ pub struct NemotronHandle {
     model: Arc<Mutex<NemotronModel>>,
     vocab: Arc<SentencePieceVocab>,
     mel_basis: Arc<Array2<f32>>,
+    /// FFT plan built once at load and reused across every mel computation
+    /// (deterministic from `N_FFT`); avoids rebuilding the planner per chunk.
+    fft_plan: Arc<dyn RealToComplex<f32>>,
     mode: NemotronMode,
     num_encoder_layers: usize,
     hidden_dim: usize,
@@ -121,6 +125,8 @@ pub struct Nemotron {
     model: Arc<Mutex<NemotronModel>>,
     vocab: Arc<SentencePieceVocab>,
     mel_basis: Arc<Array2<f32>>,
+    /// FFT plan shared from the handle (built once); see [`NemotronHandle`].
+    fft_plan: Arc<dyn RealToComplex<f32>>,
     mode: NemotronMode,
     num_encoder_layers: usize,
     hidden_dim: usize,
@@ -166,6 +172,7 @@ impl NemotronHandle {
         let exec = exec_config.unwrap_or_default();
         let model = NemotronModel::from_pretrained(path, exec, vocab_size)?;
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
+        let fft_plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
 
         let mode = if model.has_prompt {
             NemotronMode::Multilingual
@@ -183,6 +190,7 @@ impl NemotronHandle {
             model: Arc::new(Mutex::new(model)),
             vocab: Arc::new(vocab),
             mel_basis: Arc::new(mel_basis),
+            fft_plan,
             mode,
             num_encoder_layers: cfg.num_encoder_layers,
             hidden_dim: cfg.hidden_dim,
@@ -252,6 +260,7 @@ impl Nemotron {
             model: Arc::clone(&handle.model),
             vocab: Arc::clone(&handle.vocab),
             mel_basis: Arc::clone(&handle.mel_basis),
+            fft_plan: Arc::clone(&handle.fft_plan),
             mode: handle.mode,
             num_encoder_layers: handle.num_encoder_layers,
             hidden_dim: handle.hidden_dim,
@@ -612,7 +621,8 @@ impl Nemotron {
         }
 
         let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&preemph, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
+        let spec =
+            crate::audio::stft_with_plan(&preemph, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
         let mel = self.mel_basis.dot(&spec);
 
         Ok(mel.mapv(|x| (x + LOG_ZERO_GUARD).ln()))
@@ -677,6 +687,7 @@ mod tests {
             model: Arc::new(Mutex::new(model)),
             vocab: Arc::new(SentencePieceVocab { pieces: vec![] }),
             mel_basis: Arc::new(Array2::zeros((cfg.hidden_dim, 1))),
+            fft_plan: realfft::RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT),
             mode: NemotronMode::Multilingual,
             num_encoder_layers: cfg.num_encoder_layers,
             hidden_dim: cfg.hidden_dim,

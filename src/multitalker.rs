@@ -20,7 +20,9 @@ use crate::sortformer::{Sortformer, NUM_SPEAKERS};
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
 use ndarray::{s, Array2, Array3};
+use realfft::RealToComplex;
 use std::path::Path;
+use std::sync::Arc;
 
 // Reuse the same audio constants as Nemotron (same encoder architecture)
 const SAMPLE_RATE: usize = 16000;
@@ -203,6 +205,9 @@ pub struct MultitalkerASR {
     speakers: Vec<SpeakerInstance>,
     config: MultitalkerConfig,
     mel_basis: Array2<f32>,
+    /// FFT plan built once at load and reused across every mel computation
+    /// (deterministic from `N_FFT`); avoids rebuilding the planner per chunk.
+    fft_plan: Arc<dyn RealToComplex<f32>>,
     audio_buffer: Vec<f32>,
     audio_processed: usize,
     chunk_idx: usize,
@@ -233,6 +238,7 @@ impl MultitalkerASR {
         )?;
 
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
+        let fft_plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
 
         Ok(Self {
             model,
@@ -241,6 +247,7 @@ impl MultitalkerASR {
             speakers: Vec::new(),
             config: MultitalkerConfig::default(),
             mel_basis,
+            fft_plan,
             audio_buffer: Vec::new(),
             audio_processed: 0,
             chunk_idx: 0,
@@ -669,7 +676,8 @@ impl MultitalkerASR {
         }
 
         let preemph = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&preemph, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
+        let spec =
+            crate::audio::stft_with_plan(&preemph, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
         let mel = self.mel_basis.dot(&spec);
 
         Ok(mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln()))

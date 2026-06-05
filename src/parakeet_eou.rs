@@ -2,6 +2,7 @@ use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_eou::{EncoderCache, ParakeetEOUModel};
 use ndarray::{s, Array2, Array3};
+use realfft::RealToComplex;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,9 @@ pub struct ParakeetEOUHandle {
     model: Arc<Mutex<ParakeetEOUModel>>,
     tokenizer: Arc<tokenizers::Tokenizer>,
     mel_basis: Arc<Array2<f32>>,
+    /// FFT plan built once at load and reused across every mel computation
+    /// (deterministic from `N_FFT`); avoids rebuilding the planner per chunk.
+    fft_plan: Arc<dyn RealToComplex<f32>>,
     blank_id: i32,
     eou_id: i32,
 }
@@ -40,6 +44,8 @@ pub struct ParakeetEOU {
     model: Arc<Mutex<ParakeetEOUModel>>,
     tokenizer: Arc<tokenizers::Tokenizer>,
     mel_basis: Arc<Array2<f32>>,
+    /// FFT plan shared from the handle (built once); see [`ParakeetEOUHandle`].
+    fft_plan: Arc<dyn RealToComplex<f32>>,
     blank_id: i32,
     eou_id: i32,
     encoder_cache: EncoderCache,
@@ -73,11 +79,13 @@ impl ParakeetEOUHandle {
         let exec_config = config.unwrap_or_default();
         let model = ParakeetEOUModel::from_pretrained(path, exec_config)?;
         let mel_basis = create_mel_filterbank_htk();
+        let fft_plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(N_FFT);
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
             tokenizer: Arc::new(tokenizer),
             mel_basis: Arc::new(mel_basis),
+            fft_plan,
             blank_id,
             eou_id,
         })
@@ -111,6 +119,7 @@ impl ParakeetEOU {
             model: Arc::clone(&handle.model),
             tokenizer: Arc::clone(&handle.tokenizer),
             mel_basis: Arc::clone(&handle.mel_basis),
+            fft_plan: Arc::clone(&handle.fft_plan),
             blank_id: handle.blank_id,
             eou_id: handle.eou_id,
             encoder_cache: EncoderCache::new(),
@@ -256,7 +265,8 @@ impl ParakeetEOU {
 
     fn extract_mel_features(&self, audio: &[f32]) -> Result<Array3<f32>> {
         let audio_pre = crate::audio::apply_preemphasis(audio, PREEMPH);
-        let spec = crate::audio::stft(&audio_pre, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
+        let spec =
+            crate::audio::stft_with_plan(&audio_pre, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
         let mel = self.mel_basis.dot(&spec);
         let mel_log = mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln());
         Ok(mel_log.insert_axis(ndarray::Axis(0)))
