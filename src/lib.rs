@@ -97,4 +97,4 @@ pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStream
 pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
 
 #[cfg(feature = "cohere")]
-pub use cohere::CohereASR;
+pub use cohere::{CohereASR, CohereOptions};
