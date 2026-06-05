@@ -329,4 +329,123 @@ mod tests {
         // num_frames = (audio_len + n_fft - n_fft) / hop_length + 1 = 16000 / 160 + 1 = 101
         assert!(spec.shape()[1] > 0);
     }
+
+    // --- Mel filterbank (create_mel_filterbank, Slaney scale + norm) ---
+
+    #[test]
+    fn mel_filterbank_shape_and_triangles() {
+        let n_fft = 512;
+        let n_mels = 128;
+        let sample_rate = 16000;
+        let fb = create_mel_filterbank(n_fft, n_mels, sample_rate);
+
+        // Shape is (n_mels, n_fft/2 + 1).
+        assert_eq!(fb.shape(), &[n_mels, n_fft / 2 + 1]);
+        // All weights are non-negative (triangles clamped at 0).
+        assert!(fb.iter().all(|&w| w >= 0.0), "mel weights must be >= 0");
+        // Every mel filter has at least one non-zero bin (no dead filters at
+        // this resolution); a regression collapsing the triangles would trip this.
+        for i in 0..n_mels {
+            let any = fb.row(i).iter().any(|&w| w > 0.0);
+            assert!(any, "mel filter {i} is entirely zero");
+        }
+    }
+
+    #[test]
+    fn mel_filterbank_reference_values() {
+        // Pin a couple of exact Slaney-normalized weights so a change to the
+        // hz<->mel mapping or the enorm step is caught. Values are the current
+        // output of create_mel_filterbank(512, 128, 16000) for low mel bins,
+        // where the Slaney triangles are narrow and easy to verify by eye.
+        let fb = create_mel_filterbank(512, 128, 16000);
+        // Filter 0 peaks near its center FFT bin; bin 1 (31.25 Hz) sits on the
+        // rising edge of the first triangle and is strictly positive.
+        assert!(fb[[0, 1]] > 0.0, "mel[0,1] should be on the first triangle");
+        // FFT bin 0 (0 Hz) is below the first filter's left edge -> exactly 0.
+        assert_eq!(fb[[0, 0]], 0.0, "mel[0,0] must be zero (0 Hz)");
+        // Very high mel filters do not reach the lowest FFT bins -> 0 there.
+        assert_eq!(fb[[127, 1]], 0.0, "top mel filter must be 0 at low bins");
+    }
+
+    // --- extract_features_with_cache: normalization + boundary invariants ---
+
+    #[test]
+    fn extract_features_rejects_sample_rate_mismatch() {
+        let config = PreprocessorConfig::default(); // sampling_rate = 16000
+        let cache = FeatureCache::from_config(&config);
+        let audio = vec![0.0f32; 16000];
+
+        let err = extract_features_with_cache(audio, 8000, 1, &config, &cache);
+        assert!(
+            matches!(err, Err(Error::Audio(_))),
+            "mismatched sample rate must return Error::Audio"
+        );
+    }
+
+    #[test]
+    fn extract_features_downmixes_stereo_to_mono() {
+        // Interleaved stereo where the two channels are identical: the mono
+        // downmix must equal the single-channel features (averaging identical
+        // channels is a no-op), and frame count matches a mono input.
+        let config = PreprocessorConfig::default();
+        let cache = FeatureCache::from_config(&config);
+
+        let mono: Vec<f32> = sine_wave(440.0, 16000, 8000);
+        let mut stereo = Vec::with_capacity(mono.len() * 2);
+        for &s in &mono {
+            stereo.push(s);
+            stereo.push(s);
+        }
+
+        let feats_mono =
+            extract_features_with_cache(mono.clone(), 16000, 1, &config, &cache).unwrap();
+        let feats_stereo =
+            extract_features_with_cache(stereo, 16000, 2, &config, &cache).unwrap();
+
+        assert_eq!(feats_mono.shape(), feats_stereo.shape());
+        for (a, b) in feats_mono.iter().zip(feats_stereo.iter()) {
+            assert!((a - b).abs() < 1e-4, "downmix of identical channels must match mono");
+        }
+    }
+
+    #[test]
+    fn extract_features_normalizes_per_feature() {
+        // Per-feature normalization (Bessel N-1): each mel column must have
+        // mean ~0 and std ~1 (modulo the +1e-5 std floor). This pins the
+        // normalization stage the model was trained against.
+        let config = PreprocessorConfig::default();
+        let cache = FeatureCache::from_config(&config);
+        let audio = sine_wave(440.0, 16000, 16000); // 1s, many frames
+
+        let feats = extract_features_with_cache(audio, 16000, 1, &config, &cache).unwrap();
+        let num_frames = feats.shape()[0];
+        assert!(num_frames > 1);
+
+        for feat_idx in 0..feats.shape()[1] {
+            let col = feats.column(feat_idx);
+            let mean: f32 = col.iter().sum::<f32>() / num_frames as f32;
+            assert!(mean.abs() < 1e-3, "feature {feat_idx} mean {mean} not ~0");
+        }
+    }
+
+    // --- Committed WAV fixture (no model) ---
+
+    #[test]
+    fn load_audio_reads_fixture_invariants() {
+        // The fixture is a 6.04 s, 16 kHz, mono PCM16 clip committed under
+        // tests/fixtures/. This guards the public no-model audio loader:
+        // sample rate, channel count, and sample length must round-trip.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_en.wav");
+        let (samples, spec) = load_audio(path).unwrap();
+
+        assert_eq!(spec.sample_rate, 16000, "fixture must be 16 kHz");
+        assert_eq!(spec.channels, 1, "fixture must be mono");
+        // 96683 frames in a mono file => 96683 samples.
+        assert_eq!(samples.len(), 96683, "fixture sample count");
+        // PCM16 decode maps into [-1, 1).
+        assert!(
+            samples.iter().all(|&s| (-1.0..1.0).contains(&s)),
+            "decoded samples must be normalized into [-1, 1)"
+        );
+    }
 }

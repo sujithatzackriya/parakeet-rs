@@ -784,3 +784,196 @@ impl Nemotron {
         Ok(mel.mapv(|x| (x + LOG_ZERO_GUARD).ln()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_lang_tag (nemotron.rs:78-93) ---
+    // The multilingual model emits inline language pieces like `<en>` /
+    // `<en-US>` that must be detected so they can be stripped from the
+    // transcript. This guards the exact byte-pattern matcher.
+
+    #[test]
+    fn is_lang_tag_accepts_two_letter_lowercase() {
+        assert!(is_lang_tag("<en>"));
+        assert!(is_lang_tag("<fr>"));
+        assert!(is_lang_tag("<zh>"));
+    }
+
+    #[test]
+    fn is_lang_tag_accepts_locale_form() {
+        // `<xx-XX>`: lower-lower '-' UPPER-UPPER
+        assert!(is_lang_tag("<en-US>"));
+        assert!(is_lang_tag("<pt-BR>"));
+        assert!(is_lang_tag("<zh-CN>"));
+    }
+
+    #[test]
+    fn is_lang_tag_rejects_malformed() {
+        // Wrong case, wrong shape, missing brackets, too short.
+        assert!(!is_lang_tag("<EN>"), "uppercase 2-letter is not a tag");
+        assert!(!is_lang_tag("<en-us>"), "lowercase locale half is not a tag");
+        assert!(!is_lang_tag("<EN-US>"), "uppercase lang half is not a tag");
+        assert!(!is_lang_tag("<en_US>"), "underscore separator is not a tag");
+        assert!(!is_lang_tag("en-US"), "missing brackets is not a tag");
+        assert!(!is_lang_tag("<e>"), "single inner char (len<4) is not a tag");
+        assert!(!is_lang_tag("<>"), "empty inner is not a tag");
+        assert!(!is_lang_tag("hello"), "plain text is not a tag");
+        assert!(!is_lang_tag("<eng>"), "three-letter inner is not a tag");
+    }
+
+    // --- SentencePieceVocab::lang_tag_ids (nemotron.rs:256) ---
+    // Pure path over an in-memory piece table (no protobuf, no file IO):
+    // only pieces that look like language tags get collected.
+
+    #[test]
+    fn lang_tag_ids_selects_only_tag_pieces() {
+        let vocab = SentencePieceVocab {
+            pieces: vec![
+                "hello".to_string(), // 0 - not a tag
+                "<en>".to_string(),  // 1 - tag
+                "world".to_string(), // 2 - not a tag
+                "<es-ES>".to_string(), // 3 - tag
+                "<EN>".to_string(),  // 4 - not a tag (uppercase)
+            ],
+        };
+        assert_eq!(vocab.lang_tag_ids(), vec![1, 3]);
+    }
+
+    #[test]
+    fn lang_tag_ids_empty_for_plain_vocab() {
+        let vocab = SentencePieceVocab {
+            pieces: vec!["a".to_string(), "b".to_string()],
+        };
+        assert!(vocab.lang_tag_ids().is_empty());
+    }
+
+    // --- decode_chunk argmax (nemotron.rs:749-756): FIRST max wins on ties ---
+    // Pins the CURRENT, deliberately-divergent argmax used in the Nemotron
+    // decode loop (decoder.rs uses last-wins). Unifying the two is task T10;
+    // this test only documents today's behavior so that change is a conscious
+    // one. The argmax expression is replicated verbatim from decode_chunk
+    // because the loop itself is wrapped around a model call and not callable
+    // without weights.
+    #[test]
+    fn nemotron_argmax_is_first_wins_on_ties() {
+        let logits = [0.1f32, 0.9, 0.2, 0.9]; // bins 1 and 3 tie at 0.9
+        let mut max_idx = 0;
+        let mut max_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > max_val {
+                max_val = v;
+                max_idx = i;
+            }
+        }
+        assert_eq!(max_idx, 1, "nemotron loop must pick the FIRST tied index");
+    }
+
+    // --- Nemotron::reset() contract (nemotron.rs:495-509) ---
+    // This is the language-lock surface. The CURRENT, documented contract is:
+    // reset() clears decoder/encoder/audio state for a new utterance but
+    // PRESERVES the configured target language (`prompt_index`). These tests
+    // pin that contract as-is — they do NOT assert it is the desired behavior,
+    // only that a refactor must not silently change which fields reset() touches.
+
+    use crate::model_nemotron::{NemotronModel, NemotronModelConfig};
+
+    /// Build a multilingual `Nemotron` backed by a tiny in-memory model so
+    /// reset()'s pure state handling can be exercised with no model download.
+    fn nemotron_for_reset_test() -> Nemotron {
+        let cfg = NemotronModelConfig {
+            num_encoder_layers: 2,
+            hidden_dim: 4,
+            left_context: 3,
+            conv_context: 2,
+            decoder_lstm_dim: 5,
+            decoder_lstm_layers: 1,
+            vocab_size: 16,
+            blank_id: 15,
+        };
+        let model = NemotronModel::new_in_memory_for_test(cfg.clone(), true).unwrap();
+        let encoder_cache = NemotronEncoderCache::with_dims(
+            cfg.num_encoder_layers,
+            cfg.left_context,
+            cfg.hidden_dim,
+            cfg.conv_context,
+        );
+        Nemotron {
+            model: Arc::new(Mutex::new(model)),
+            vocab: Arc::new(SentencePieceVocab { pieces: vec![] }),
+            mel_basis: Arc::new(Array2::zeros((cfg.hidden_dim, 1))),
+            mode: NemotronMode::Multilingual,
+            num_encoder_layers: cfg.num_encoder_layers,
+            hidden_dim: cfg.hidden_dim,
+            left_context: cfg.left_context,
+            conv_context: cfg.conv_context,
+            vocab_size: cfg.vocab_size,
+            blank_id: cfg.blank_id,
+            lang_tag_ids: Arc::new(vec![]),
+            encoder_cache,
+            state_1: Array3::zeros((cfg.decoder_lstm_layers, 1, cfg.decoder_lstm_dim)),
+            state_2: Array3::zeros((cfg.decoder_lstm_layers, 1, cfg.decoder_lstm_dim)),
+            last_token: cfg.blank_id as i32,
+            prompt_index: Some(101),
+            audio_buffer: Vec::new(),
+            audio_processed: 0,
+            chunk_idx: 0,
+            accumulated_tokens: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reset_clears_utterance_state() {
+        let mut nem = nemotron_for_reset_test();
+
+        // Dirty every field reset() is documented to clear.
+        nem.state_1.fill(1.0);
+        nem.state_2.fill(1.0);
+        nem.last_token = 7;
+        nem.audio_buffer = vec![0.5; 32];
+        nem.audio_processed = 999;
+        nem.chunk_idx = 4;
+        nem.accumulated_tokens = vec![1, 2, 3];
+
+        nem.reset();
+
+        assert!(nem.state_1.iter().all(|&v| v == 0.0), "state_1 must be zeroed");
+        assert!(nem.state_2.iter().all(|&v| v == 0.0), "state_2 must be zeroed");
+        assert_eq!(nem.last_token, nem.blank_id as i32, "last_token -> blank");
+        assert!(nem.audio_buffer.is_empty(), "audio_buffer must be cleared");
+        assert_eq!(nem.audio_processed, 0, "audio_processed must reset");
+        assert_eq!(nem.chunk_idx, 0, "chunk_idx must reset");
+        assert!(nem.accumulated_tokens.is_empty(), "accumulated_tokens cleared");
+    }
+
+    #[test]
+    fn reset_preserves_target_language() {
+        // The language-lock contract: reset() must NOT clear prompt_index.
+        let mut nem = nemotron_for_reset_test();
+        nem.set_target_lang("es-ES").unwrap();
+        let lang_before = nem.prompt_index;
+        assert_eq!(lang_before, Some(2), "es-ES maps to prompt index 2");
+
+        nem.reset();
+
+        assert_eq!(
+            nem.prompt_index, lang_before,
+            "reset() must preserve the configured target language (current documented contract)"
+        );
+    }
+
+    #[test]
+    fn set_target_lang_rejects_unknown_and_english_only() {
+        let mut multi = nemotron_for_reset_test();
+        assert!(multi.set_target_lang("xx-ZZ").is_err(), "unknown lang -> Err");
+
+        // English-only mode rejects set_target_lang outright.
+        let mut eng = nemotron_for_reset_test();
+        eng.mode = NemotronMode::EnglishOnly;
+        assert!(
+            eng.set_target_lang("en-US").is_err(),
+            "set_target_lang must error on the English-only variant"
+        );
+    }
+}

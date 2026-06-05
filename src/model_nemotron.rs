@@ -134,6 +134,32 @@ impl NemotronModel {
         })
     }
 
+    /// Test-only constructor that builds both sessions from a tiny in-memory
+    /// identity ONNX graph, so state-management tests (e.g. `Nemotron::reset`)
+    /// can run with NO 2 GB model download. The sessions are never executed by
+    /// those tests; only the surrounding Rust state is exercised.
+    #[cfg(test)]
+    pub(crate) fn new_in_memory_for_test(
+        config: NemotronModelConfig,
+        has_prompt: bool,
+    ) -> Result<Self> {
+        // Minimal `Identity` ONNX (ir_version 9, opset 13), emitted by the
+        // onnx Python helper. Two independent sessions are built from it.
+        const IDENTITY_ONNX: &[u8] = &[
+            8, 9, 58, 55, 10, 16, 10, 1, 120, 18, 1, 121, 34, 8, 73, 100, 101, 110, 116, 105,
+            116, 121, 18, 1, 103, 90, 15, 10, 1, 120, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 1,
+            98, 15, 10, 1, 121, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 1, 66, 4, 10, 0, 16, 13,
+        ];
+        let encoder = Session::builder()?.commit_from_memory(IDENTITY_ONNX)?;
+        let decoder_joint = Session::builder()?.commit_from_memory(IDENTITY_ONNX)?;
+        Ok(Self {
+            encoder,
+            decoder_joint,
+            config,
+            has_prompt,
+        })
+    }
+
     /// Run encoder with cache-aware streaming.
     /// `prompt_index` must be `Some(_)` for multilingual models and `None`
     /// for eng only mistmaching will produce an ORT InvalidArgument err.
