@@ -8,11 +8,45 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 // Shared NeMo front-end geometry, single-sourced in crate::audio::constants.
-use crate::audio::constants::{N_FFT, N_MELS, SAMPLE_RATE};
+use crate::audio::constants::{HOP_LENGTH, N_FFT, N_MELS, SAMPLE_RATE};
 
 // EOU intentionally uses an HTK-scale filterbank capped at FMAX (distinct from
 // the Slaney filterbank in audio.rs); this cap is EOU-specific, not shared.
 const FMAX: f32 = 8000.0;
+
+/// New mel frames the encoder slice (`PRE_ENCODE_CACHE + FRAMES_PER_CHUNK`)
+/// assumes arrive per [`ParakeetEOU::transcribe`] call.
+const FRAMES_PER_CHUNK: usize = 16;
+
+/// Exact number of audio samples each [`ParakeetEOU::transcribe`] chunk must
+/// contain (`FRAMES_PER_CHUNK * HOP_LENGTH` = 16 * 160 = 2560 samples ≈ 160 ms
+/// at 16 kHz).
+///
+/// The streaming path has no processed-sample cursor: it re-slices the last
+/// `PRE_ENCODE_CACHE + FRAMES_PER_CHUNK` mel frames from the rolling buffer on
+/// every call (`parakeet_eou.rs`). That tail slice only aligns with the genuine
+/// new audio when exactly `FRAMES_PER_CHUNK` new frames arrived; an off-size
+/// chunk shifts the window and silently duplicates or drops tokens. Chunk size
+/// is therefore validated at the boundary rather than corrupting the stream.
+pub const EOU_CHUNK_SAMPLES: usize = FRAMES_PER_CHUNK * HOP_LENGTH;
+
+/// Reject any chunk whose length is not exactly [`EOU_CHUNK_SAMPLES`].
+///
+/// Returns [`Error::Audio`] with the expected vs actual length so an off-size
+/// chunk fails fast with a clear, structured error instead of silently
+/// corrupting the token stream. Correctly-sized chunks pass through unchanged.
+fn validate_chunk_size(len: usize) -> Result<()> {
+    if len == EOU_CHUNK_SAMPLES {
+        Ok(())
+    } else {
+        Err(Error::Audio(format!(
+            "ParakeetEOU::transcribe requires exactly {EOU_CHUNK_SAMPLES} samples per chunk \
+             (160 ms at 16 kHz); got {len}. The streaming path slices a fixed mel window per \
+             call and has no processed-sample cursor, so an off-size chunk would duplicate or \
+             drop tokens. Resample/repacketize the input to {EOU_CHUNK_SAMPLES}-sample chunks."
+        )))
+    }
+}
 
 /// Shared handle to a loaded ParakeetEOU model.
 /// The ONNX session is loaded once and reference-counted.
@@ -131,8 +165,18 @@ impl ParakeetEOU {
     /// Transcribe a chunk of audio samples.
     ///
     /// # Arguments
-    /// * `chunk` - Audio chunk (typically 160ms / 2560 samples at 16kHz)
+    /// * `chunk` - Audio chunk of exactly [`EOU_CHUNK_SAMPLES`] samples
+    ///   (160 ms / 2560 samples at 16 kHz). Any other length returns
+    ///   [`Error::Audio`] (see the chunk-size note below).
     /// * `reset_on_eou` - If true, reset decoder state when end-of-utterance is detected
+    ///
+    /// # Chunk-size requirement
+    /// The streaming path re-slices a fixed `PRE_ENCODE_CACHE + FRAMES_PER_CHUNK`
+    /// mel window from the rolling buffer on every call and tracks no
+    /// processed-sample cursor, so it is only correct when exactly
+    /// `FRAMES_PER_CHUNK` new mel frames arrive per call. The chunk length is
+    /// validated up front and an off-size chunk is rejected with a structured
+    /// error rather than silently duplicating or dropping tokens.
     ///
     /// # Known limitation (M20)
     /// The EOU reset is asymmetric: it soft-resets only the decoder state
@@ -148,6 +192,12 @@ impl ParakeetEOU {
     /// - Slices last (pre_encode_cache + new_frames) for encoder input
     /// - pre_encode_cache=9 frames, new_frames=~16, total=~25 frames to encoder
     pub fn transcribe(&mut self, chunk: &[f32], reset_on_eou: bool) -> Result<String> {
+        // Validate chunk size before touching any state: the tail-slice path
+        // assumes exactly EOU_CHUNK_SAMPLES (FRAMES_PER_CHUNK new mel frames),
+        // so reject off-size chunks deterministically rather than corrupting the
+        // stream. Correctly-sized chunks fall through unchanged.
+        validate_chunk_size(chunk.len())?;
+
         // Add new chunk to rolling buffer
         self.audio_buffer.extend(chunk.iter().copied());
 
@@ -170,7 +220,6 @@ impl ParakeetEOU {
         // Slice to take only (pre_encode_cache + new_frames) for encoder
         // pre_encode_cache = 9 frames, new_frames = ~16 for 160ms chunk
         const PRE_ENCODE_CACHE: usize = 9;
-        const FRAMES_PER_CHUNK: usize = 16;
         const SLICE_LEN: usize = PRE_ENCODE_CACHE + FRAMES_PER_CHUNK;
 
         let start_frame = total_frames.saturating_sub(SLICE_LEN);
@@ -309,4 +358,37 @@ fn create_mel_filterbank_htk() -> Array2<f32> {
     }
 
     weights
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_chunk_samples_matches_frame_geometry() {
+        // The validation contract: one chunk == FRAMES_PER_CHUNK new mel frames,
+        // each HOP_LENGTH samples wide. Guards against the two constants drifting.
+        assert_eq!(EOU_CHUNK_SAMPLES, FRAMES_PER_CHUNK * HOP_LENGTH);
+        assert_eq!(EOU_CHUNK_SAMPLES, 2560);
+    }
+
+    #[test]
+    fn correct_size_chunk_passes_validation() {
+        assert!(validate_chunk_size(EOU_CHUNK_SAMPLES).is_ok());
+    }
+
+    #[test]
+    fn off_size_chunk_is_rejected_with_structured_error() {
+        // Too short, too long, and empty must all be rejected with Error::Audio
+        // (the structured variant), carrying the expected/actual lengths.
+        for len in [0, 1, EOU_CHUNK_SAMPLES - 1, EOU_CHUNK_SAMPLES + 1, 4096] {
+            match validate_chunk_size(len) {
+                Err(Error::Audio(msg)) => {
+                    assert!(msg.contains(&EOU_CHUNK_SAMPLES.to_string()));
+                    assert!(msg.contains(&len.to_string()));
+                }
+                other => panic!("expected Err(Error::Audio) for len {len}, got {other:?}"),
+            }
+        }
+    }
 }

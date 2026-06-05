@@ -90,7 +90,7 @@ pub use config::{ModelConfig as ModelConfigJson, PreprocessorConfig};
 
 pub use decoder::{TimedToken, TranscriptionResult};
 pub use nemotron::{Nemotron, NemotronHandle, NemotronMode};
-pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle};
+pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle, EOU_CHUNK_SAMPLES};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 
 #[cfg(feature = "multitalker")]

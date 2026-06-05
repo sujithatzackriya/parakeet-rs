@@ -116,8 +116,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Streaming: ");
         let mut full_text = String::new();
 
-        for chunk in audio.chunks(chunk_size) {
-            let text = model.transcribe(&chunk.to_vec(), false)?;
+        for chunk_data in audio.chunks(chunk_size) {
+            // transcribe() requires exactly EOU_CHUNK_SAMPLES samples; zero-pad
+            // the trailing partial chunk to the required size.
+            let chunk: Vec<f32> = if chunk_data.len() < chunk_size {
+                let mut p = chunk_data.to_vec();
+                p.resize(chunk_size, 0.0);
+                p
+            } else {
+                chunk_data.to_vec()
+            };
+            let text = model.transcribe(&chunk, false)?;
             if !text.is_empty() {
                 print!("{}", text);
                 std::io::stdout().flush()?;
